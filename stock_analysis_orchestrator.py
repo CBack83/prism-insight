@@ -481,6 +481,30 @@ class StockAnalysisOrchestrator:
 
                         if tracking_success:
                             logger.info("트래킹 시스템 배치 실행 완료")
+
+                            # 7. 실제 계좌 포트폴리오 리포트 전송
+                            try:
+                                logger.info("실제 계좌 포트폴리오 리포트 전송 시작")
+
+                                from trading.portfolio_telegram_reporter import PortfolioTelegramReporter
+
+                                portfolio_reporter = PortfolioTelegramReporter(
+                                    telegram_token=telegram_token,
+                                    chat_id=chat_id,
+                                    trading_mode="real"
+                                )
+
+                                report_success = await portfolio_reporter.send_portfolio_report()
+
+                                if report_success:
+                                    logger.info("📊 실제 계좌 포트폴리오 리포트 전송 완료")
+                                else:
+                                    logger.error("❌ 포트폴리오 리포트 전송 실패")
+
+                            except Exception as portfolio_error:
+                                logger.error(f"포트폴리오 리포트 전송 중 오류: {str(portfolio_error)}")
+                                import traceback
+                                logger.error(traceback.format_exc())
                         else:
                             logger.error("트래킹 시스템 배치 실행 실패")
 

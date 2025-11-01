@@ -305,6 +305,16 @@ class StockTrackingAgent:
                 )
             """)
 
+            # quantity 컬럼 추가 (기존 테이블에 없는 경우)
+            try:
+                self.cursor.execute("ALTER TABLE stock_holdings ADD COLUMN quantity INTEGER DEFAULT 0")
+                logger.info("stock_holdings 테이블에 quantity 컬럼 추가 완료")
+            except sqlite3.OperationalError as e:
+                if "duplicate column" in str(e).lower():
+                    logger.info("quantity 컬럼이 이미 존재합니다")
+                else:
+                    raise
+
             # 매매 이력 테이블 생성
             self.cursor.execute("""
                 CREATE TABLE IF NOT EXISTS trading_history (
@@ -915,12 +925,12 @@ class StockTrackingAgent:
             # 현재 시간
             now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-            # 보유종목 테이블에 추가
+            # 보유종목 테이블에 추가 (quantity는 0으로 초기화, 매수 후 업데이트)
             self.cursor.execute(
                 """
-                INSERT INTO stock_holdings 
-                (ticker, company_name, buy_price, buy_date, current_price, last_updated, scenario, target_price, stop_loss) 
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO stock_holdings
+                (ticker, company_name, buy_price, buy_date, current_price, last_updated, scenario, target_price, stop_loss, quantity)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     ticker,
@@ -931,7 +941,8 @@ class StockTrackingAgent:
                     now,
                     json.dumps(scenario, ensure_ascii=False),
                     scenario.get('target_price', 0),
-                    scenario.get('stop_loss', 0)
+                    scenario.get('stop_loss', 0),
+                    0  # 초기값, 매수 후 실제 수량으로 업데이트
                 )
             )
             self.conn.commit()
@@ -1208,6 +1219,79 @@ class StockTrackingAgent:
         Returns:
             List[Dict]: 매도된 종목 정보 리스트
         """
+        # ===== 2025-10-27 추가: 실제 계좌 잔고 확인 및 동기화 =====
+        from trading.domestic_stock_trading import DomesticStockTrading
+
+        logger.info("=== 실제 증권사 계좌 잔고 확인 시작 ===")
+        trader = DomesticStockTrading(mode="real") # 명시적으로 real 모드 사용
+
+        # 2025-10-27 추가: 실제 계좌 포트폴리오 조회
+        real_portfolio = trader.get_portfolio()
+        real_account = trader.get_account_summary()
+
+        # 2025-10-27 추가: 로그 출력
+        logger.info(f"실제 계좌: {trader.trenv.my_acct}-{trader.trenv.my_prod}")
+        logger.info(f"총 평가액: {real_account.get('total_eval_amount', 0):,.0f}원 ")
+        logger.info(f"실제 보유 종목 수: {len(real_portfolio)}개")
+        for stock in real_portfolio:
+            logger.info(f"  - {stock['stock_name']}({stock['stock_code']}): {stock['quantity']}주")
+
+        # 2025-10-27 추가: DB와 실제 계좌 비교
+        self.cursor.execute("SELECT ticker, company_name, quantity FROM stock_holdings")
+        db_holdings = {row[0]: (row[1], row[2]) for row in self.cursor.fetchall()}
+        real_holdings = {stock['stock_code']: (stock['stock_name'], stock['quantity'])
+                         for stock in real_portfolio}
+        
+        # 2025-10-29 개선: DB와 실제 계좌 동기화
+        logger.info("=== DB와 실제 계좌 동기화 시작 ===")
+
+        sync_actions = []
+
+        # 1. 실제 계좌의 종목을 DB에 반영
+        for stock_code, (stock_name, quantity) in real_holdings.items():
+            if stock_code in db_holdings:
+                # DB에 있는 종목: 수량 업데이트
+                db_qty = db_holdings[stock_code][1]
+                if db_qty != quantity:
+                    self.cursor.execute(
+                        "UPDATE stock_holdings SET quantity = ? WHERE ticker = ?",
+                        (quantity, stock_code)
+                    )
+                    sync_actions.append(f"✓ {stock_code}({stock_name}): {db_qty}주 → {quantity}주 업데이트")
+                    logger.info(f"수량 동기화: {stock_code} {db_qty}주 → {quantity}주")
+            else:
+                # DB에 없는 종목: 경고만 출력 (매수 기록 없음)
+                sync_actions.append(f"⚠️ {stock_code}({stock_name}): 실제 {quantity}주 보유, DB에 기록 없음 (수동 매수?)")
+                logger.warning(f"DB에 없는 종목 발견: {stock_code}({stock_name}) {quantity}주")
+
+        # 2. DB에만 있고 실제 계좌에 없는 종목: 제거
+        for ticker in db_holdings.keys():
+            if ticker not in real_holdings:
+                # DB에서 제거
+                self.cursor.execute("DELETE FROM stock_holdings WHERE ticker = ?", (ticker,))
+                company_name = db_holdings[ticker][0]
+                sync_actions.append(f"🗑️ {ticker}({company_name}): DB에서 제거 (실제 계좌에 없음)")
+                logger.info(f"DB에서 제거: {ticker}({company_name}) - 실제 계좌에 없음")
+
+        # 변경사항 커밋
+        self.conn.commit()
+
+        # 동기화 결과 로그
+        if sync_actions:
+            logger.info(f"동기화 완료: {len(sync_actions)}건의 변경사항")
+            for action in sync_actions:
+                logger.info(f"  {action}")
+
+            # 텔레그램 알림
+            alert_msg = "🔄 **계좌 동기화 완료**\n\n"
+            for action in sync_actions:
+                alert_msg += f"{action}\n"
+            self.message_queue.append(alert_msg)
+        else:
+            logger.info("✅ DB와 실제 계좌 이미 동기화됨")
+
+        # ======================================================== 이하는 기존 로직 계속
+
         try:
             logger.info("보유 종목 정보 업데이트 시작")
 
@@ -1268,7 +1352,7 @@ class StockTrackingAgent:
                     if sell_success:
                         # 실제 계좌 매매 함수 호출(비동기)
                         from trading.domestic_stock_trading import AsyncTradingContext
-                        async with AsyncTradingContext() as trading:
+                        async with AsyncTradingContext(mode="real") as trading:
                             # 비동기 매도 실행
                             trade_result = await trading.async_sell_stock(stock_code=ticker)
 
@@ -1487,18 +1571,57 @@ class StockTrackingAgent:
                 min_score = scenario.get("min_score", 0)
                 logger.info(f"매수 점수 체크: {company_name}({ticker}) - 점수: {buy_score}")
                 if analysis_result.get("decision") == "진입":
+                    # 2025-10-29 추가: 매수 전 실계좌 잔고 확인
+                    logger.info("=== 매수 전 실계좌 잔고 확인 ===")
+
+                    from trading.domestic_stock_trading import DomesticStockTrading
+                    trader = DomesticStockTrading(mode="real")
+                    account_summary = trader.get_account_summary()
+
+                    available_amount = account_summary.get('available_amount', 0) if account_summary else 0
+                    buy_amount = trader.buy_amount
+
+                    logger.info(f"주문가능금액: {available_amount:,.0f}원")
+                    logger.info(f"매수 예정 금액: {buy_amount:,.0f}원")
+
+                    # 잔고 부족 체크
+                    if available_amount < buy_amount:
+                        logger.warning(f"❌ 주문가능금액 부족: {available_amount:,.0f}원 < {buy_amount:,.0f}원")
+
+                        # 텔레그램 알림
+                        alert_msg = f"⚠️ **매수 불가** - {company_name}({ticker})\n\n"
+                        alert_msg += f"주문가능금액: `{available_amount:,.0f}원`\n"
+                        alert_msg += f"매수 필요 금액: `{buy_amount:,.0f}원`\n"
+                        alert_msg += f"부족 금액: `{buy_amount - available_amount:,.0f}원`"
+                        self.message_queue.append(alert_msg)
+
+                        logger.info(f"매수 보류: {company_name}({ticker}) - 잔고 부족")
+                        continue  # 다음 종목으로
+
+                    logger.info(f"✅ 잔고 충분: {available_amount:,.0f}원 >= {buy_amount:,.0f}원")
+
                     # 매수 처리
                     buy_success = await self.buy_stock(ticker, company_name, current_price, scenario, rank_change_msg)
 
                     if buy_success:
                         # 실제 계좌 매매 함수 호출(비동기)
                         from trading.domestic_stock_trading import AsyncTradingContext
-                        async with AsyncTradingContext() as trading:
+                        async with AsyncTradingContext(mode="real") as trading:
                             # 비동기 매수 실행
                             trade_result = await trading.async_buy_stock(stock_code=ticker)
 
                         if trade_result['success']:
                             logger.info(f"실제 매수 성공: {trade_result['message']}")
+
+                            # 2025-10-29 추가: 매수 성공 후 실제 수량을 DB에 업데이트
+                            actual_quantity = trade_result.get('quantity', 0)
+                            if actual_quantity > 0:
+                                self.cursor.execute(
+                                    "UPDATE stock_holdings SET quantity = ? WHERE ticker = ?",
+                                    (actual_quantity, ticker)
+                                )
+                                self.conn.commit()
+                                logger.info(f"DB 수량 업데이트: {ticker} → {actual_quantity}주")
                         else:
                             logger.error(f"실제 매수 실패: {trade_result['message']}")
 

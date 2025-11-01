@@ -564,18 +564,57 @@ class EnhancedStockTrackingAgent(StockTrackingAgent):
 
                 # 진입 결정이면 매수 처리
                 if decision == "진입" and buy_score >= min_score and sector_diverse:
+                    # 2025-10-29 추가: 매수 전 실계좌 잔고 확인
+                    logger.info("=== 매수 전 실계좌 잔고 확인 ===")
+
+                    from trading.domestic_stock_trading import DomesticStockTrading
+                    trader = DomesticStockTrading(mode="real")
+                    account_summary = trader.get_account_summary()
+
+                    available_amount = account_summary.get('available_amount', 0) if account_summary else 0
+                    buy_amount = trader.buy_amount
+
+                    logger.info(f"주문가능금액: {available_amount:,.0f}원")
+                    logger.info(f"매수 예정 금액: {buy_amount:,.0f}원")
+
+                    # 잔고 부족 체크
+                    if available_amount < buy_amount:
+                        logger.warning(f"❌ 주문가능금액 부족: {available_amount:,.0f}원 < {buy_amount:,.0f}원")
+
+                        # 텔레그램 알림
+                        alert_msg = f"⚠️ **매수 불가** - {company_name}({ticker})\n\n"
+                        alert_msg += f"주문가능금액: `{available_amount:,.0f}원`\n"
+                        alert_msg += f"매수 필요 금액: `{buy_amount:,.0f}원`\n"
+                        alert_msg += f"부족 금액: `{buy_amount - available_amount:,.0f}원`"
+                        self.message_queue.append(alert_msg)
+
+                        logger.info(f"매수 보류: {company_name}({ticker}) - 잔고 부족")
+                        continue  # 다음 종목으로
+
+                    logger.info(f"✅ 잔고 충분: {available_amount:,.0f}원 >= {buy_amount:,.0f}원")
+
                     # 매수 처리
                     buy_success = await self.buy_stock(ticker, company_name, current_price, scenario, rank_change_msg)
 
                     if buy_success:
                         # 실제 계좌 매매 함수 호출(비동기)
                         from trading.domestic_stock_trading import AsyncTradingContext
-                        async with AsyncTradingContext() as trading:
+                        async with AsyncTradingContext(mode="real") as trading:
                             # 비동기 매수 실행
                             trade_result = await trading.async_buy_stock(stock_code=ticker)
 
                         if trade_result['success']:
                             logger.info(f"실제 매수 성공: {trade_result['message']}")
+
+                            # 2025-10-29 추가: 매수 성공 후 실제 수량을 DB에 업데이트
+                            actual_quantity = trade_result.get('quantity', 0)
+                            if actual_quantity > 0:
+                                self.cursor.execute(
+                                    "UPDATE stock_holdings SET quantity = ? WHERE ticker = ?",
+                                    (actual_quantity, ticker)
+                                )
+                                self.conn.commit()
+                                logger.info(f"DB 수량 업데이트: {ticker} → {actual_quantity}주")
                         else:
                             logger.error(f"실제 매수 실패: {trade_result['message']}")
 
