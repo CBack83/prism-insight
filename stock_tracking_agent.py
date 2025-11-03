@@ -64,20 +64,41 @@ class StockTrackingAgent:
     SCORE_CONSIDER = 7  # 매수 고려
     SCORE_UNSUITABLE = 6  # 매수 부적합
 
-    def __init__(self, db_path: str = "stock_tracking_db.sqlite", telegram_token: str = None):
+    def __init__(self, db_path: str = "stock_tracking_db.sqlite", telegram_token: str = None, trading_mode: str = None):
         """
         에이전트 초기화
 
         Args:
             db_path: SQLite 데이터베이스 파일 경로
             telegram_token: 텔레그램 봇 토큰
+            trading_mode: 트레이딩 모드 ('demo' 또는 'real', None이면 yaml 설정 사용)
         """
         self.max_slots = self.MAX_SLOTS
         self.message_queue = []  # 텔레그램 메시지 저장용
-        self.trading_agent = None
+        self.trading_agent = None  # AI 에이전트 (시나리오 생성)
+        self.trading_api_client = None  # 트레이딩 API 클라이언트 (재사용)
         self.db_path = db_path
         self.conn = None
         self.cursor = None
+
+        # 트레이딩 모드 설정 (yaml 파일에서 default_mode 로드)
+        import yaml
+        try:
+            config_file = Path(__file__).parent / "trading" / "config" / "kis_devlp.yaml"
+            with open(config_file, encoding="UTF-8") as f:
+                _cfg = yaml.load(f, Loader=yaml.FullLoader)
+            default_mode = _cfg.get("default_mode", "demo")
+        except Exception as e:
+            logger.warning(f"yaml 설정 파일 로드 실패, 기본값 'demo' 사용: {e}")
+            default_mode = "demo"
+
+        self.trading_mode = trading_mode if trading_mode is not None else default_mode
+        logger.info(f"StockTrackingAgent 트레이딩 모드: {self.trading_mode}")
+
+        # 트레이딩 API 클라이언트 초기화 (싱글톤처럼 재사용)
+        from trading.domestic_stock_trading import DomesticStockTrading
+        self.trading_api_client = DomesticStockTrading(mode=self.trading_mode)
+        logger.info(f"트레이딩 API 클라이언트 초기화 완료 (mode: {self.trading_mode})")
 
         # 텔레그램 봇 토큰 설정
         self.telegram_token = telegram_token or os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -1220,17 +1241,15 @@ class StockTrackingAgent:
             List[Dict]: 매도된 종목 정보 리스트
         """
         # ===== 2025-10-27 추가: 실제 계좌 잔고 확인 및 동기화 =====
-        from trading.domestic_stock_trading import DomesticStockTrading
-
         logger.info("=== 실제 증권사 계좌 잔고 확인 시작 ===")
-        trader = DomesticStockTrading(mode="real") # 명시적으로 real 모드 사용
 
+        # 2025-11-03 개선: 기존 self.trading_api_client 재사용 (새 인스턴스 생성 지양)
         # 2025-10-27 추가: 실제 계좌 포트폴리오 조회
-        real_portfolio = trader.get_portfolio()
-        real_account = trader.get_account_summary()
+        real_portfolio = self.trading_api_client.get_portfolio()
+        real_account = self.trading_api_client.get_account_summary()
 
         # 2025-10-27 추가: 로그 출력
-        logger.info(f"실제 계좌: {trader.trenv.my_acct}-{trader.trenv.my_prod}")
+        logger.info(f"실제 계좌: {self.trading_api_client.trenv.my_acct}-{self.trading_api_client.trenv.my_prod}")
         logger.info(f"총 평가액: {real_account.get('total_eval_amount', 0):,.0f}원 ")
         logger.info(f"실제 보유 종목 수: {len(real_portfolio)}개")
         for stock in real_portfolio:
@@ -1260,9 +1279,56 @@ class StockTrackingAgent:
                     sync_actions.append(f"✓ {stock_code}({stock_name}): {db_qty}주 → {quantity}주 업데이트")
                     logger.info(f"수량 동기화: {stock_code} {db_qty}주 → {quantity}주")
             else:
-                # DB에 없는 종목: 경고만 출력 (매수 기록 없음)
-                sync_actions.append(f"⚠️ {stock_code}({stock_name}): 실제 {quantity}주 보유, DB에 기록 없음 (수동 매수?)")
-                logger.warning(f"DB에 없는 종목 발견: {stock_code}({stock_name}) {quantity}주")
+                # 2025-11-03 개선: DB에 없는 종목을 수동 매수 종목으로 추가
+                # 실제 포트폴리오에서 추가 정보 조회
+                stock_info = next((s for s in real_portfolio if s['stock_code'] == stock_code), None)
+                if stock_info:
+                    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    avg_price = stock_info.get('avg_price', 0)
+                    current_price = stock_info.get('current_price', 0)
+
+                    # 기본 시나리오 생성 (수동 매수이므로 AI 분석 없음)
+                    manual_scenario = {
+                        "decision": "보유",
+                        "buy_score": 5,  # 중립 점수
+                        "min_score": 5,
+                        "target_price": int(avg_price * 1.10),  # 평단가 대비 +10%
+                        "stop_loss": int(avg_price * 0.95),     # 평단가 대비 -5%
+                        "note": "수동 매수 종목 (자동 추가)",
+                        "period": "중기"
+                    }
+
+                    # DB에 추가
+                    self.cursor.execute(
+                        """
+                        INSERT INTO stock_holdings
+                        (ticker, company_name, buy_price, buy_date, current_price, last_updated,
+                         scenario, target_price, stop_loss, quantity)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            stock_code,
+                            stock_name,
+                            avg_price,
+                            now,
+                            current_price,
+                            now,
+                            json.dumps(manual_scenario, ensure_ascii=False),
+                            manual_scenario['target_price'],
+                            manual_scenario['stop_loss'],
+                            quantity
+                        )
+                    )
+
+                    sync_actions.append(
+                        f"➕ {stock_code}({stock_name}): DB에 추가 (수동 매수 {quantity}주, "
+                        f"평단가 {avg_price:,.0f}원)"
+                    )
+                    logger.info(f"수동 매수 종목 DB 추가: {stock_code}({stock_name}) {quantity}주")
+                else:
+                    # 정보를 찾을 수 없는 경우 경고만
+                    sync_actions.append(f"⚠️ {stock_code}({stock_name}): 실제 {quantity}주 보유, 정보 조회 실패")
+                    logger.warning(f"DB에 없는 종목 정보 조회 실패: {stock_code}({stock_name})")
 
         # 2. DB에만 있고 실제 계좌에 없는 종목: 제거
         for ticker in db_holdings.keys():
@@ -1351,8 +1417,9 @@ class StockTrackingAgent:
 
                     if sell_success:
                         # 실제 계좌 매매 함수 호출(비동기)
+                        # 2025-11-03 개선: 동적 모드 사용 (self.trading_mode)
                         from trading.domestic_stock_trading import AsyncTradingContext
-                        async with AsyncTradingContext(mode="real") as trading:
+                        async with AsyncTradingContext(mode=self.trading_mode) as trading:
                             # 비동기 매도 실행
                             trade_result = await trading.async_sell_stock(stock_code=ticker)
 
@@ -1574,12 +1641,11 @@ class StockTrackingAgent:
                     # 2025-10-29 추가: 매수 전 실계좌 잔고 확인
                     logger.info("=== 매수 전 실계좌 잔고 확인 ===")
 
-                    from trading.domestic_stock_trading import DomesticStockTrading
-                    trader = DomesticStockTrading(mode="real")
-                    account_summary = trader.get_account_summary()
+                    # 2025-11-03 개선: 기존 self.trading_api_client 재사용
+                    account_summary = self.trading_api_client.get_account_summary()
 
                     available_amount = account_summary.get('available_amount', 0) if account_summary else 0
-                    buy_amount = trader.buy_amount
+                    buy_amount = self.trading_api_client.buy_amount
 
                     logger.info(f"주문가능금액: {available_amount:,.0f}원")
                     logger.info(f"매수 예정 금액: {buy_amount:,.0f}원")
@@ -1605,8 +1671,9 @@ class StockTrackingAgent:
 
                     if buy_success:
                         # 실제 계좌 매매 함수 호출(비동기)
+                        # 2025-11-03 개선: 동적 모드 사용 (self.trading_mode)
                         from trading.domestic_stock_trading import AsyncTradingContext
-                        async with AsyncTradingContext(mode="real") as trading:
+                        async with AsyncTradingContext(mode=self.trading_mode) as trading:
                             # 비동기 매수 실행
                             trade_result = await trading.async_buy_stock(stock_code=ticker)
 
