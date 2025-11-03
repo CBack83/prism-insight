@@ -1343,12 +1343,20 @@ class DomesticStockTrading:
                 if output2:
                     pchs_amt = float(output2.get('pchs_amt_smtl_amt', 0)) or 1  # 0이면 1로 대체
 
+                    # KIS API 필드 설명:
+                    # - ord_psbl_cash: D+2 예수금 기준 주문가능현금 (매도 대금 정산 전이면 0일 수 있음)
+                    # - dnca_tot_amt: 예수금 총액 (실제 정산된 현금)
+                    # - prvs_rcdl_excc_amt: 가수도 정산 금액 (D+2 정산 대기 중인 매도 대금 포함)
+                    
+                    # 가수도 정산 금액 기준으로 주문가능금액 계산
+                    available_amount = float(output2.get('prvs_rcdl_excc_amt', 0))
+
                     account_summary = {
                         'total_eval_amount': float(output2.get('tot_evlu_amt', 0)),
                         'total_profit_amount': float(output2.get('evlu_pfls_smtl_amt', 0)),
                         'total_profit_rate': round(float(output2.get('evlu_pfls_smtl_amt', 0)) / pchs_amt * 100, 2),
                         'deposit': float(output2.get('dnca_tot_amt', 0)),
-                        'available_amount': float(output2.get('ord_psbl_cash', 0))
+                        'available_amount': available_amount
                     }
 
                     logger.info(f"계좌 요약: 총평가 {account_summary['total_eval_amount']:,.0f}원, "
