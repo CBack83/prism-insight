@@ -130,7 +130,8 @@ class StockAnalysisOrchestrator:
                                     ticker_codes.add(code)
                                     tickers.append({
                                         'code': code,
-                                        'name': stock.get('name', '')
+                                        'name': stock.get('name', ''),
+                                        'trigger_price': stock.get('current_price', 0.0)  # 트리거 시점 가격 저장
                                     })
 
                 logger.info(f"선정된 종목 수: {len(tickers)}")
@@ -558,11 +559,13 @@ class StockAnalysisOrchestrator:
             if isinstance(ticker_info, dict):
                 ticker = ticker_info.get('code')
                 company_name = ticker_info.get('name', f"종목_{ticker}")
+                trigger_price = ticker_info.get('trigger_price', 0.0)
             else:
                 ticker = ticker_info
                 company_name = f"종목_{ticker}"
+                trigger_price = 0.0
 
-            logger.info(f"[{idx}/{len(tickers)}] 종목 분석 시작: {company_name}({ticker})")
+            logger.info(f"[{idx}/{len(tickers)}] 종목 분석 시작: {company_name}({ticker}) - 트리거 가격: {trigger_price:,.0f}원")
 
             # 출력 파일 경로 설정
             reference_date = datetime.now().strftime("%Y%m%d")
@@ -580,8 +583,34 @@ class StockAnalysisOrchestrator:
                     reference_date=reference_date
                 )
 
-                # 결과 저장
+                # 결과 저장 및 가격 검증
                 if report and len(report.strip()) > 0:
+                    # 가격 Cross-Validation
+                    if trigger_price > 0:
+                        try:
+                            from cores.data_validator import extract_price_from_report, validate_analysis_price
+
+                            analyzed_price = extract_price_from_report(report)
+                            if analyzed_price:
+                                validate_analysis_price(
+                                    analyzed_price=analyzed_price,
+                                    trigger_price=trigger_price,
+                                    tolerance=0.1,  # 10% 허용 오차
+                                    company_name=company_name
+                                )
+                                logger.info(
+                                    f"✅ 가격 검증 통과: {company_name} "
+                                    f"(트리거={trigger_price:,.0f}원, 분석={analyzed_price:,.0f}원)"
+                                )
+                            else:
+                                logger.warning(
+                                    f"⚠️ 보고서에서 가격 추출 실패: {company_name}"
+                                )
+                        except Exception as ve:
+                            logger.error(f"❌ 가격 검증 실패: {company_name} - {str(ve)}")
+                            # 가격 검증 실패 시 보고서 저장하지 않고 스킵
+                            continue
+
                     with open(output_file, "w", encoding="utf-8") as f:
                         f.write(report)
                     logger.info(f"[{idx}/{len(tickers)}] 보고서 생성 완료: {company_name}({ticker}) - {len(report)} 글자")

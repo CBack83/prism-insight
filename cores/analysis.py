@@ -13,6 +13,14 @@ from cores.stock_chart import (
     get_chart_as_base64_html
 )
 from cores.utils import clean_markdown
+from cores.exceptions import CriticalDataSourceError, DataValidationError
+from cores.data_validator import (
+    verify_mcp_server_health,
+    validate_report_data,
+    create_data_quality_metadata,
+    format_metadata_for_report
+)
+from cores.telegram_alert import send_telegram_alert
 
 
 # 시장 분석 캐시 저장소 (전역 변수)
@@ -44,9 +52,37 @@ async def analyze_stock(company_code: str = "000660", company_name: str = "SK하
 
         # 2. 공유 리소스로 데이터를 저장할 딕셔너리 생성
         section_reports = {}
+        data_sources_status = {}
 
         # 3. 분석할 섹션 정의
         base_sections = ["price_volume_analysis", "investor_trading_analysis", "company_status", "company_overview", "news_analysis", "market_index_analysis"]
+
+        # 3.1 필수 MCP 서버 사전 점검 (Fail-Fast)
+        required_servers = ["kospi_kosdaq"]
+        logger.info("필수 MCP 서버 연결 상태 확인 중...")
+
+        for server_name in required_servers:
+            is_healthy = await verify_mcp_server_health(server_name, parallel_app)
+            data_sources_status[server_name] = is_healthy
+
+            if not is_healthy:
+                error_msg = (
+                    f"🚨 [긴급] 필수 데이터 소스 '{server_name}' 연결 실패\n"
+                    f"종목: {company_name}({company_code})\n"
+                    f"분석 시각: {reference_date}\n"
+                    f"분석이 중단되었습니다."
+                )
+                logger.critical(error_msg)
+
+                # Telegram 알람 전송
+                await send_telegram_alert(error_msg)
+
+                # 즉시 중단
+                raise CriticalDataSourceError(
+                    f"필수 데이터 소스 '{server_name}' 사용 불가. 분석 중단."
+                )
+
+        logger.info("✅ 모든 필수 MCP 서버 정상 확인")
 
         # 4. 에이전트 가져오기
         agents = get_agent_directory(company_name, company_code, reference_date, base_sections)
@@ -70,9 +106,35 @@ async def analyze_stock(company_code: str = "000660", company_name: str = "SK하
                             _market_analysis_cache["report"] = report
                     else:
                         report = await generate_report(agent, section, company_name, company_code, reference_date, logger)
+
+                    # 보고서 데이터 검증
+                    try:
+                        validate_report_data(report, section)
+                        logger.info(f"✅ {section} 데이터 검증 통과")
+                    except DataValidationError as ve:
+                        error_msg = (
+                            f"⚠️ [경고] 데이터 검증 실패\n"
+                            f"종목: {company_name}({company_code})\n"
+                            f"섹션: {section}\n"
+                            f"오류: {str(ve)}"
+                        )
+                        logger.warning(error_msg)
+                        await send_telegram_alert(error_msg)
+                        raise ve
+
                     section_reports[section] = report
                 except Exception as e:
                     logger.error(f"Final failure processing {section}: {e}")
+
+                    # 긴급 알람 전송
+                    error_msg = (
+                        f"🚨 [오류] 섹션 분석 실패\n"
+                        f"종목: {company_name}({company_code})\n"
+                        f"섹션: {section}\n"
+                        f"오류: {str(e)}"
+                    )
+                    await send_telegram_alert(error_msg)
+
                     section_reports[section] = f"분석 실패: {section}"
 
         # 6. 다른 보고서들의 내용을 통합
@@ -143,9 +205,17 @@ async def analyze_stock(company_code: str = "000660", company_name: str = "SK하
             market_cap_chart_html = None
             fundamentals_chart_html = None
 
-        # 11. 최종 보고서 구성
+        # 11. 데이터 품질 메타데이터 생성
+        data_quality_metadata = create_data_quality_metadata(
+            data_sources_status=data_sources_status,
+            timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            validation_passed=True
+        )
+        metadata_section = format_metadata_for_report(data_quality_metadata)
+
+        # 12. 최종 보고서 구성
         disclaimer = get_disclaimer()
-        final_report = disclaimer + "\n\n" + executive_summary + "\n\n"
+        final_report = disclaimer + "\n\n" + metadata_section + "\n\n" + executive_summary + "\n\n"
 
         all_sections = base_sections + ["investment_strategy"]
         for section in all_sections:
