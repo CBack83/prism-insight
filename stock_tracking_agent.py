@@ -44,7 +44,7 @@ logger = logging.getLogger(__name__)
 # MCP related imports
 from mcp_agent.app import MCPApp
 from mcp_agent.workflows.llm.augmented_llm import RequestParams
-from cores.llm.openai_responses_llm import OpenAIResponsesLLM as OpenAIAugmentedLLM
+from cores.llm.trading_llm_selector import OpenAIAugmentedLLM, SELECTED_TRADING_LLM_BACKEND
 
 # Core agent imports
 from cores.openai_error_logging import log_openai_error
@@ -168,6 +168,8 @@ class StockTrackingAgent:
         self.account_configs = self._get_trading_accounts()
         if self.account_configs:
             self._set_active_account(self.account_configs[0])
+            await self._reconcile_pending_buy_orders()
+            await self._reconcile_pending_sell_orders()
         else:
             logger.warning("No trading accounts configured - skipping trade execution")
 
@@ -669,6 +671,446 @@ class StockTrackingAgent:
             logger.error(traceback.format_exc())
             return False
 
+    def _is_non_filled_buy_result(self, trade_result: Dict[str, Any]) -> bool:
+        """Return True when KIS accepted/reserved an order but no fill is confirmed yet."""
+        order_status = str(trade_result.get("order_status", "")).lower()
+        order_type = str(trade_result.get("order_type", "")).lower()
+        message = str(trade_result.get("message", "")).lower()
+        if trade_result.get("filled") is False or trade_result.get("is_reserved_order") is True:
+            return True
+        return (
+            order_status in {"reserved", "queued", "pending"}
+            or "reserved" in order_type
+            or "reservation" in order_type
+            or "reserved" in message
+            or "예약" in message
+        )
+
+    def _is_non_filled_sell_result(self, trade_result: Dict[str, Any]) -> bool:
+        """Return True when KIS accepted/reserved a sell order but no fill is confirmed yet."""
+        order_status = str(trade_result.get("order_status", "")).lower()
+        order_type = str(trade_result.get("order_type", "")).lower()
+        message = str(trade_result.get("message", "")).lower()
+        if trade_result.get("filled") is False or trade_result.get("is_reserved_order") is True:
+            return True
+        return (
+            order_status in {"reserved", "queued", "pending"}
+            or "reserved" in order_type
+            or "reservation" in order_type
+            or "reserved" in message
+            or "예약" in message
+        )
+
+    def _append_pending_buy_message(
+        self,
+        ticker: str,
+        company_name: str,
+        current_price: float,
+        scenario: Dict[str, Any],
+        trade_result: Dict[str, Any],
+    ) -> None:
+        """Notify that a buy is pending/reserved without recording it as a holding."""
+        target_price = scenario.get('target_price', 0)
+        stop_loss = scenario.get('stop_loss', 0)
+        quantity = trade_result.get('quantity')
+        qty_text = f"{quantity}주" if quantity else "수량 확인 필요"
+        message = (
+            f"⏳ 국내주식 매수 예약/대기: {company_name}({ticker})\n"
+            f"기준가: {current_price:,.0f}원\n"
+            f"목표가: {target_price:,.0f}원\n"
+            f"손절가: {stop_loss:,.0f}원\n"
+            f"주문: {qty_text} / {trade_result.get('message', '예약 또는 대기 주문')}\n"
+            "참고: 실제 체결/보유 확인 전까지 내부 보유 종목으로 기록하지 않습니다.\n"
+            f"투자근거: {scenario.get('rationale', '정보 없음')}"
+        )
+        self._msg_types.append("analysis")
+        self.message_queue.append(message)
+
+    def _record_pending_buy_order(
+        self,
+        ticker: str,
+        company_name: str,
+        current_price: float,
+        scenario: Dict[str, Any],
+        trade_result: Dict[str, Any],
+    ) -> None:
+        """Persist accepted but unfilled domestic buy orders for later reconciliation."""
+        try:
+            account_key, account_name = self._account_scope()
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            trigger_info = getattr(self, 'trigger_info_map', {}).get(ticker, {})
+            trigger_type = trigger_info.get('trigger_type', scenario.get('trigger_type', 'AI Analysis'))
+            trigger_mode = trigger_info.get('trigger_mode', scenario.get('trigger_mode', getattr(self, 'trigger_mode', 'unknown')))
+            quantity = trade_result.get('quantity') or 0
+            self.cursor.execute(
+                """
+                INSERT INTO domestic_pending_orders (
+                    account_key, account_name, ticker, company_name, order_type,
+                    requested_price, requested_quantity, requested_amount, order_no,
+                    order_status, order_message, scenario, target_price, stop_loss,
+                    trigger_type, trigger_mode, sector, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, 'buy', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    account_key,
+                    account_name,
+                    ticker,
+                    company_name,
+                    current_price,
+                    int(quantity) if quantity else None,
+                    (current_price * int(quantity)) if quantity else None,
+                    trade_result.get('order_no'),
+                    str(trade_result.get('order_status') or 'pending').lower(),
+                    trade_result.get('message'),
+                    json.dumps(scenario, ensure_ascii=False),
+                    scenario.get('target_price', 0),
+                    scenario.get('stop_loss', 0),
+                    trigger_type,
+                    trigger_mode,
+                    scenario.get('sector', '알 수 없음'),
+                    now,
+                    now,
+                ),
+            )
+            self.conn.commit()
+            logger.info(f"Pending domestic buy recorded: {company_name}({ticker}) - {trade_result.get('message')}")
+        except Exception as exc:
+            logger.error(f"Failed to record pending domestic buy for {company_name}({ticker}): {exc}")
+            logger.error(traceback.format_exc())
+
+    async def _reconcile_pending_buy_orders(self) -> None:
+        """Reconcile accepted domestic reserved/queued buy orders against actual KIS holdings."""
+        if not self.active_account:
+            return
+
+        account_key, account_name = self._account_scope()
+        self.cursor.execute(
+            """
+            SELECT * FROM domestic_pending_orders
+            WHERE account_key = ?
+              AND order_type = 'buy'
+              AND lower(order_status) IN ('reserved', 'queued', 'pending')
+            ORDER BY created_at ASC
+            """,
+            (account_key,),
+        )
+        pending_rows = [dict(row) for row in self.cursor.fetchall()]
+        if not pending_rows:
+            return
+
+        logger.info(f"Reconciling {len(pending_rows)} pending domestic buy order(s) for {account_name}")
+        try:
+            from trading.domestic_stock_trading import AsyncTradingContext
+
+            async with AsyncTradingContext(account_name=account_name) as trading:
+                portfolio = await asyncio.to_thread(trading.get_portfolio)
+        except Exception as exc:
+            logger.error(f"Pending buy reconciliation skipped: KIS portfolio lookup failed: {exc}")
+            self._msg_types.append("portfolio")
+            self.message_queue.append(
+                f"⚠️ 국내주식 예약매수 체결 확인 실패\n"
+                f"대상: {len(pending_rows)}건\n"
+                f"사유: KIS 잔고 조회 실패 - {exc}\n"
+                "안전상 내부 보유 DB에는 반영하지 않았습니다."
+            )
+            return
+
+        portfolio_by_ticker = {stock.get('stock_code'): stock for stock in portfolio}
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        for pending in pending_rows:
+            ticker = pending['ticker']
+            actual_stock = portfolio_by_ticker.get(ticker)
+            if not actual_stock:
+                logger.info(f"Pending buy not filled yet: {pending['company_name']}({ticker})")
+                self.cursor.execute(
+                    "UPDATE domestic_pending_orders SET updated_at = ? WHERE id = ?",
+                    (now, pending['id']),
+                )
+                continue
+
+            try:
+                scenario = json.loads(pending.get('scenario') or '{}')
+            except Exception:
+                scenario = {}
+
+            target_price = pending.get('target_price') or scenario.get('target_price', 0)
+            stop_loss = pending.get('stop_loss') or scenario.get('stop_loss', 0)
+            sector = pending.get('sector') or scenario.get('sector', '알 수 없음')
+            buy_price = float(actual_stock.get('avg_price') or pending.get('requested_price') or 0)
+            current_price = float(actual_stock.get('current_price') or buy_price)
+            company_name = actual_stock.get('stock_name') or pending['company_name']
+            scenario.update({
+                'pending_order_reconciled': True,
+                'pending_order_created_at': pending.get('created_at'),
+                'reconciled_at': now,
+                'actual_quantity': actual_stock.get('quantity'),
+                'actual_avg_price': buy_price,
+            })
+
+            self.cursor.execute(
+                "SELECT id FROM stock_holdings WHERE account_key = ? AND ticker = ?",
+                (account_key, ticker),
+            )
+            holding = self.cursor.fetchone()
+            if holding:
+                self.cursor.execute(
+                    """
+                    UPDATE stock_holdings
+                    SET company_name = ?, buy_price = ?, current_price = ?, last_updated = ?,
+                        scenario = ?, target_price = ?, stop_loss = ?, trigger_type = ?,
+                        trigger_mode = ?, sector = ?
+                    WHERE account_key = ? AND ticker = ?
+                    """,
+                    (
+                        company_name,
+                        buy_price,
+                        current_price,
+                        now,
+                        json.dumps(scenario, ensure_ascii=False),
+                        target_price,
+                        stop_loss,
+                        pending.get('trigger_type'),
+                        pending.get('trigger_mode'),
+                        sector,
+                        account_key,
+                        ticker,
+                    ),
+                )
+            else:
+                self.cursor.execute(
+                    """
+                    INSERT INTO stock_holdings
+                    (account_key, account_name, ticker, company_name, buy_price, buy_date,
+                     current_price, last_updated, scenario, target_price, stop_loss,
+                     trigger_type, trigger_mode, sector)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        account_key,
+                        account_name,
+                        ticker,
+                        company_name,
+                        buy_price,
+                        now,
+                        current_price,
+                        now,
+                        json.dumps(scenario, ensure_ascii=False),
+                        target_price,
+                        stop_loss,
+                        pending.get('trigger_type'),
+                        pending.get('trigger_mode'),
+                        sector,
+                    ),
+                )
+
+            self.cursor.execute(
+                """
+                UPDATE domestic_pending_orders
+                SET order_status = 'filled', updated_at = ?, reconciled_at = ?, failure_reason = NULL
+                WHERE id = ?
+                """,
+                (now, now, pending['id']),
+            )
+            self.conn.commit()
+            logger.info(f"Pending domestic buy reconciled into holdings: {company_name}({ticker}) @ {buy_price:,.0f} KRW")
+            self._msg_types.append("portfolio")
+            self.message_queue.append(
+                f"✅ 국내주식 예약매수 체결 반영: {company_name}({ticker})\n"
+                f"평단가: {buy_price:,.0f}원 / 현재가: {current_price:,.0f}원\n"
+                f"수량: {actual_stock.get('quantity')}주\n"
+                "실계좌 보유 확인 후 내부 포트폴리오 DB에 반영했습니다."
+            )
+
+        self.conn.commit()
+
+    def _append_pending_sell_message(
+        self,
+        ticker: str,
+        company_name: str,
+        current_price: float,
+        sell_reason: str,
+        trade_result: Dict[str, Any],
+    ) -> None:
+        """Notify that a sell is pending/reserved without removing the holding."""
+        quantity = trade_result.get('quantity')
+        qty_text = f"{quantity}주" if quantity else "수량 확인 필요"
+        message = (
+            f"⏳ 국내주식 매도 예약/대기: {company_name}({ticker})\n"
+            f"기준가: {current_price:,.0f}원\n"
+            f"주문: {qty_text} / {trade_result.get('message', '예약 또는 대기 주문')}\n"
+            "참고: 실제 체결되어 계좌 잔고에서 사라진 것이 확인될 때까지 내부 보유 DB에서 삭제하지 않습니다.\n"
+            f"매도이유: {sell_reason}"
+        )
+        self._msg_types.append("analysis")
+        self.message_queue.append(message)
+
+    def _record_pending_sell_order(
+        self,
+        stock_data: Dict[str, Any],
+        current_price: float,
+        sell_reason: str,
+        trade_result: Dict[str, Any],
+    ) -> None:
+        """Persist accepted but unfilled domestic sell orders for later reconciliation."""
+        try:
+            account_key = stock_data.get('account_key') or self._account_scope()[0]
+            account_name = stock_data.get('account_name') or self._account_scope()[1]
+            ticker = stock_data.get('ticker', '')
+            company_name = stock_data.get('company_name', '')
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            scenario = stock_data.get('scenario') or '{}'
+            if not isinstance(scenario, str):
+                scenario = json.dumps(scenario, ensure_ascii=False)
+
+            self.cursor.execute(
+                """
+                SELECT id FROM domestic_pending_orders
+                WHERE account_key = ? AND ticker = ? AND order_type = 'sell'
+                  AND lower(order_status) IN ('reserved', 'queued', 'pending')
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (account_key, ticker),
+            )
+            existing = self.cursor.fetchone()
+
+            values = (
+                account_name,
+                company_name,
+                current_price,
+                int(trade_result.get('quantity') or 0) or None,
+                current_price * int(trade_result.get('quantity') or 0) if trade_result.get('quantity') else None,
+                trade_result.get('order_no'),
+                str(trade_result.get('order_status') or 'pending').lower(),
+                f"{trade_result.get('message', '')} | sell_reason={sell_reason}",
+                scenario,
+                stock_data.get('target_price', 0),
+                stock_data.get('stop_loss', 0),
+                stock_data.get('trigger_type', 'AI Analysis'),
+                stock_data.get('trigger_mode', 'unknown'),
+                stock_data.get('sector'),
+                now,
+            )
+
+            if existing:
+                self.cursor.execute(
+                    """
+                    UPDATE domestic_pending_orders
+                    SET account_name = ?, company_name = ?, requested_price = ?, requested_quantity = ?,
+                        requested_amount = ?, order_no = ?, order_status = ?, order_message = ?,
+                        scenario = ?, target_price = ?, stop_loss = ?, trigger_type = ?,
+                        trigger_mode = ?, sector = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (*values, existing['id']),
+                )
+            else:
+                self.cursor.execute(
+                    """
+                    INSERT INTO domestic_pending_orders (
+                        account_key, account_name, ticker, company_name, order_type,
+                        requested_price, requested_quantity, requested_amount, order_no,
+                        order_status, order_message, scenario, target_price, stop_loss,
+                        trigger_type, trigger_mode, sector, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, 'sell', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (account_key, account_name, ticker, company_name, *values[2:]),
+                )
+            self.conn.commit()
+            logger.info(f"Pending domestic sell recorded: {company_name}({ticker}) - {trade_result.get('message')}")
+        except Exception as exc:
+            logger.error(f"Failed to record pending domestic sell for {stock_data.get('ticker')}: {exc}")
+            logger.error(traceback.format_exc())
+
+    async def _reconcile_pending_sell_orders(self) -> None:
+        """Reconcile accepted domestic reserved/queued sell orders against actual KIS holdings."""
+        if not self.active_account:
+            return
+
+        account_key, account_name = self._account_scope()
+        self.cursor.execute(
+            """
+            SELECT * FROM domestic_pending_orders
+            WHERE account_key = ?
+              AND order_type = 'sell'
+              AND lower(order_status) IN ('reserved', 'queued', 'pending')
+            ORDER BY created_at ASC
+            """,
+            (account_key,),
+        )
+        pending_rows = [dict(row) for row in self.cursor.fetchall()]
+        if not pending_rows:
+            return
+
+        logger.info(f"Reconciling {len(pending_rows)} pending domestic sell order(s) for {account_name}")
+        try:
+            from trading.domestic_stock_trading import AsyncTradingContext
+
+            async with AsyncTradingContext(account_name=account_name) as trading:
+                portfolio = await asyncio.to_thread(trading.get_portfolio)
+        except Exception as exc:
+            logger.error(f"Pending sell reconciliation skipped: KIS portfolio lookup failed: {exc}")
+            self._msg_types.append("portfolio")
+            self.message_queue.append(
+                f"⚠️ 국내주식 예약매도 체결 확인 실패\n"
+                f"대상: {len(pending_rows)}건\n"
+                f"사유: KIS 잔고 조회 실패 - {exc}\n"
+                "안전상 내부 보유 DB는 변경하지 않았습니다."
+            )
+            return
+
+        portfolio_by_ticker = {stock.get('stock_code'): stock for stock in portfolio}
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        for pending in pending_rows:
+            ticker = pending['ticker']
+            actual_stock = portfolio_by_ticker.get(ticker)
+            if actual_stock:
+                logger.info(f"Pending sell not filled yet: {pending['company_name']}({ticker})")
+                self.cursor.execute(
+                    "UPDATE domestic_pending_orders SET updated_at = ? WHERE id = ?",
+                    (now, pending['id']),
+                )
+                # Keep the holding, but refresh current price from the account when possible.
+                self.cursor.execute(
+                    """
+                    UPDATE stock_holdings
+                    SET current_price = ?, last_updated = ?
+                    WHERE account_key = ? AND ticker = ?
+                    """,
+                    (float(actual_stock.get('current_price') or pending.get('requested_price') or 0), now, account_key, ticker),
+                )
+                continue
+
+            self.cursor.execute(
+                "SELECT * FROM stock_holdings WHERE account_key = ? AND ticker = ?",
+                (account_key, ticker),
+            )
+            holding = self.cursor.fetchone()
+            if holding:
+                stock_data = dict(holding)
+                stock_data['current_price'] = pending.get('requested_price') or stock_data.get('current_price') or 0
+                await self.sell_stock(stock_data, f"예약매도 체결 확인: {pending.get('order_message') or ''}")
+
+            self.cursor.execute(
+                """
+                UPDATE domestic_pending_orders
+                SET order_status = 'filled', updated_at = ?, reconciled_at = ?, failure_reason = NULL
+                WHERE id = ?
+                """,
+                (now, now, pending['id']),
+            )
+            self.conn.commit()
+            logger.info(f"Pending domestic sell reconciled out of holdings: {pending['company_name']}({ticker})")
+            self._msg_types.append("portfolio")
+            self.message_queue.append(
+                f"✅ 국내주식 예약매도 체결 반영: {pending['company_name']}({ticker})\n"
+                "실계좌 잔고에서 미보유로 확인되어 내부 포트폴리오 DB에서 제거했습니다."
+            )
+
+        self.conn.commit()
+
     async def buy_stock(self, ticker: str, company_name: str, current_price: float, scenario: Dict[str, Any], rank_change_msg: str = "") -> bool:
         """
         Process stock purchase
@@ -1164,10 +1606,23 @@ class StockTrackingAgent:
                 return []
 
             sold_stocks = []
+            self.cursor.execute(
+                """
+                SELECT ticker FROM domestic_pending_orders
+                WHERE account_key = ? AND order_type = 'sell'
+                  AND lower(order_status) IN ('reserved', 'queued', 'pending')
+                """,
+                (self._account_scope()[0],),
+            )
+            pending_sell_tickers = {row['ticker'] for row in self.cursor.fetchall()}
 
             for stock in holdings:
                 ticker = stock.get('ticker')
                 company_name = stock.get('company_name')
+
+                if ticker in pending_sell_tickers:
+                    logger.info(f"Skipping sell analysis for {company_name}({ticker}): pending sell order exists")
+                    continue
 
                 # Query current stock price
                 current_price = await self._get_current_stock_price(ticker)
@@ -1198,24 +1653,41 @@ class StockTrackingAgent:
                 # Current time
                 now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+                # Refresh the DB price before any sell attempt. If a sell order is rejected
+                # or left pending/reserved, the holding remains with a fresh price.
+                self.cursor.execute(
+                    """UPDATE stock_holdings
+                       SET current_price = ?, last_updated = ?
+                       WHERE ticker = ? AND account_key = ?""",
+                    (current_price, now, ticker, stock.get("account_key"))
+                )
+                self.conn.commit()
+
                 # Analyze sell decision
                 should_sell, sell_reason = await self._analyze_sell_decision(stock)
 
                 if should_sell:
-                    # Process sell
-                    sell_success = await self.sell_stock(stock, sell_reason)
+                    sell_success = False
+                    trade_result = {'success': False, 'message': 'Trading not executed'}
 
-                    if sell_success:
-                        # Call actual account trading function (async)
-                        from trading.domestic_stock_trading import AsyncTradingContext
-                        async with AsyncTradingContext(account_name=stock.get("account_name")) as trading:
-                            # Execute async sell with limit price for reserved orders
-                            trade_result = await trading.async_sell_stock(stock_code=ticker, limit_price=current_price)
+                    # Execute the real account sell first.  Only remove the holding after a confirmed fill.
+                    from trading.domestic_stock_trading import AsyncTradingContext
+                    async with AsyncTradingContext(account_name=stock.get("account_name")) as trading:
+                        # Execute async sell with limit price for reserved orders
+                        trade_result = await trading.async_sell_stock(stock_code=ticker, limit_price=current_price)
 
-                        if trade_result['success']:
-                            logger.info(f"Actual sell successful: {trade_result['message']}")
-                        else:
-                            logger.error(f"Actual sell failed: {trade_result['message']}")
+                    if trade_result.get('success'):
+                        logger.info(f"Actual sell request accepted: {trade_result.get('message')}")
+                    else:
+                        logger.error(f"Actual sell failed: {trade_result.get('message')}")
+
+                    is_non_filled_sell = self._is_non_filled_sell_result(trade_result)
+                    if trade_result.get('success') and is_non_filled_sell:
+                        self._record_pending_sell_order(stock, current_price, sell_reason, trade_result)
+                        self._append_pending_sell_message(ticker, company_name, current_price, sell_reason, trade_result)
+                        logger.info(f"{ticker}({company_name}) sell is pending/reserved; holding kept until account reconciliation")
+                    elif trade_result.get('success'):
+                        sell_success = await self.sell_stock(stock, sell_reason)
 
                         # [Optional] Publish sell signal via Redis Streams
                         # Auto-skipped if Redis not configured (requires UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN)
@@ -1453,6 +1925,9 @@ class StockTrackingAgent:
                 label = self._safe_account_log_label(account)
                 logger.info(f"Processing KR reports for account {label}")
 
+                await self._reconcile_pending_buy_orders()
+                await self._reconcile_pending_sell_orders()
+
                 # 1. Update existing holdings and make sell decisions
                 sold_stocks = await self.update_holdings()
                 sell_count += len(sold_stocks)
@@ -1497,65 +1972,107 @@ class StockTrackingAgent:
                     logger.info(f"Buy score check: {company_name}({ticker}) - Score: {buy_score}")
 
                     if analysis_result.get("decision") == "Enter":
-                        buy_success = await self.buy_stock(ticker, company_name, current_price, scenario, rank_change_msg)
+                        trade_result = {'success': False, 'message': 'Trading not executed'}
 
-                        if buy_success:
-                            from trading.domestic_stock_trading import AsyncTradingContext
+                        if current_price > 0:
+                            try:
+                                from trading.domestic_stock_trading import AsyncTradingContext
 
-                            async with AsyncTradingContext(account_name=account["name"]) as trading:
-                                trade_result = await trading.async_buy_stock(stock_code=ticker, limit_price=current_price)
+                                async with AsyncTradingContext(account_name=account["name"]) as trading:
+                                    trade_result = await trading.async_buy_stock(stock_code=ticker, limit_price=current_price)
 
-                            if trade_result['success']:
-                                logger.info(f"Actual purchase successful: {trade_result['message']}")
-                            else:
-                                logger.error(f"Actual purchase failed: {trade_result['message']}")
-
-                            if trade_result.get("partial_success"):
-                                successful = trade_result.get("successful_accounts", [])
-                                failed = trade_result.get("failed_accounts", [])
-                                logger.warning(
-                                    f"{ticker} partial success: {len(successful)}/{len(successful) + len(failed)} accounts"
-                                )
-
-                            if ticker not in signaled_tickers:
-                                try:
-                                    from messaging.redis_signal_publisher import publish_buy_signal
-
-                                    await publish_buy_signal(
-                                        ticker=ticker,
-                                        company_name=company_name,
-                                        price=current_price,
-                                        scenario=scenario,
-                                        source="AI Analysis",
-                                        trade_result=trade_result
-                                    )
-                                except Exception as signal_err:
-                                    logger.warning(f"Buy signal publish failed (non-critical): {signal_err}")
-
-                                try:
-                                    from messaging.gcp_pubsub_signal_publisher import publish_buy_signal as gcp_publish_buy_signal
-
-                                    await gcp_publish_buy_signal(
-                                        ticker=ticker,
-                                        company_name=company_name,
-                                        price=current_price,
-                                        scenario=scenario,
-                                        source="AI Analysis",
-                                        trade_result=trade_result
-                                    )
-                                except Exception as signal_err:
-                                    logger.warning(f"GCP buy signal publish failed (non-critical): {signal_err}")
-
-                                signaled_tickers.add(ticker)
-
-                        if buy_success:
-                            buy_count += 1
-                            state["traded"] = True
-                            logger.info(f"Purchase complete: {company_name}({ticker}) @ {current_price:,.0f} KRW")
+                                if trade_result.get('success'):
+                                    logger.info(f"KIS buy request accepted: {trade_result.get('message')}")
+                                else:
+                                    logger.error(f"Actual purchase failed: {trade_result.get('message')}")
+                            except Exception as trade_err:
+                                logger.warning(f"Trading execution skipped: {trade_err}")
+                                trade_result = {'success': False, 'message': str(trade_err)}
                         else:
+                            logger.warning(f"Skipping actual purchase for {ticker}: invalid current_price ({current_price})")
+                            trade_result = {'success': False, 'message': f'Invalid current_price ({current_price})'}
+
+                        is_non_filled = self._is_non_filled_buy_result(trade_result)
+                        trade_actually_succeeded = bool(
+                            (trade_result.get('success') or trade_result.get('partial_success'))
+                            and not is_non_filled
+                        )
+
+                        if trade_actually_succeeded:
+                            buy_success = await self.buy_stock(ticker, company_name, current_price, scenario, rank_change_msg)
+
+                            if buy_success:
+                                buy_count += 1
+                                state["traded"] = True
+                                logger.info(f"Purchase complete: {company_name}({ticker}) @ {current_price:,.0f} KRW")
+
+                                if trade_result.get("partial_success"):
+                                    successful = trade_result.get("successful_accounts", [])
+                                    failed = trade_result.get("failed_accounts", [])
+                                    logger.warning(
+                                        f"{ticker} partial success: {len(successful)}/{len(successful) + len(failed)} accounts"
+                                    )
+
+                                if ticker not in signaled_tickers:
+                                    try:
+                                        from messaging.redis_signal_publisher import publish_buy_signal
+
+                                        await publish_buy_signal(
+                                            ticker=ticker,
+                                            company_name=company_name,
+                                            price=current_price,
+                                            scenario=scenario,
+                                            source="AI Analysis",
+                                            trade_result=trade_result
+                                        )
+                                    except Exception as signal_err:
+                                        logger.warning(f"Buy signal publish failed (non-critical): {signal_err}")
+
+                                    try:
+                                        from messaging.gcp_pubsub_signal_publisher import publish_buy_signal as gcp_publish_buy_signal
+
+                                        await gcp_publish_buy_signal(
+                                            ticker=ticker,
+                                            company_name=company_name,
+                                            price=current_price,
+                                            scenario=scenario,
+                                            source="AI Analysis",
+                                            trade_result=trade_result
+                                        )
+                                    except Exception as signal_err:
+                                        logger.warning(f"GCP buy signal publish failed (non-critical): {signal_err}")
+
+                                    signaled_tickers.add(ticker)
+                            else:
+                                state["should_save_watchlist"] = True
+                                state["skip_reason"] = state["skip_reason"] or "Holding record failed after KIS order success"
+                                logger.warning(f"Purchase record failed after KIS order success: {company_name}({ticker})")
+                        elif trade_result.get('success') and is_non_filled:
+                            state["pending"] = True
+                            state["should_save_watchlist"] = False
+                            logger.info(
+                                f"Buy reserved/queued, not recorded as holding yet: {company_name}({ticker}) - "
+                                f"{trade_result.get('message')}"
+                            )
+                            self._record_pending_buy_order(
+                                ticker=ticker,
+                                company_name=company_name,
+                                current_price=current_price,
+                                scenario=scenario,
+                                trade_result=trade_result,
+                            )
+                            self._append_pending_buy_message(
+                                ticker=ticker,
+                                company_name=company_name,
+                                current_price=current_price,
+                                scenario=scenario,
+                                trade_result=trade_result,
+                            )
+                        else:
+                            reason = f"KIS order failed: {trade_result.get('message', 'Unknown')}"
                             state["should_save_watchlist"] = True
-                            state["skip_reason"] = state["skip_reason"] or "Purchase failed"
-                            logger.warning(f"Purchase failed: {company_name}({ticker})")
+                            state["skip_reason"] = state["skip_reason"] or reason
+                            logger.warning(f"Purchase not recorded: {company_name}({ticker}) - {reason}")
                         continue
 
                     reason = ""

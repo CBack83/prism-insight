@@ -120,3 +120,27 @@ id_ed25519*
 archive.db
 archive.db-shm
 archive.db-wal
+
+# Local agent/tool state - never commit
+.cache/
+.claude/
+.serena/
+.write_test
+
+# Local virtual environments
+venv/
+.venv/
+
+# Local backups and one-off generated artifacts
+backups/
+*_backup.txt
+requirements_backup.txt
+morning_test.pid
+portfolio_verification_result.json
+macro_intelligence_*.json
+trigger_results.json
+
+# Local sync/review notes
+/git-sync-report-*.md
+crontab_backup_*.txt
+*_분석보고서_*.md

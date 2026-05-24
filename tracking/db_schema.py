@@ -53,6 +53,34 @@ CREATE TABLE IF NOT EXISTS trading_history (
 )
 """
 
+# Table: domestic_pending_orders
+TABLE_DOMESTIC_PENDING_ORDERS = """
+CREATE TABLE IF NOT EXISTS domestic_pending_orders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_key TEXT NOT NULL,
+    account_name TEXT,
+    ticker TEXT NOT NULL,
+    company_name TEXT NOT NULL,
+    order_type TEXT NOT NULL DEFAULT 'buy',
+    requested_price REAL,
+    requested_quantity INTEGER,
+    requested_amount REAL,
+    order_no TEXT,
+    order_status TEXT NOT NULL DEFAULT 'pending',
+    order_message TEXT,
+    scenario TEXT,
+    target_price REAL,
+    stop_loss REAL,
+    trigger_type TEXT,
+    trigger_mode TEXT,
+    sector TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT,
+    reconciled_at TEXT,
+    failure_reason TEXT
+)
+"""
+
 # Table: watchlist_history
 TABLE_WATCHLIST_HISTORY = """
 CREATE TABLE IF NOT EXISTS watchlist_history (
@@ -270,6 +298,8 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_stock_holdings_account_key ON stock_holdings(account_key)",
     "CREATE INDEX IF NOT EXISTS idx_stock_holdings_account_ticker ON stock_holdings(account_key, ticker)",
     "CREATE INDEX IF NOT EXISTS idx_trading_history_account_key ON trading_history(account_key)",
+    "CREATE INDEX IF NOT EXISTS idx_domestic_pending_orders_account_status ON domestic_pending_orders(account_key, order_status)",
+    "CREATE INDEX IF NOT EXISTS idx_domestic_pending_orders_ticker ON domestic_pending_orders(account_key, ticker)",
     "CREATE INDEX IF NOT EXISTS idx_watchlist_ticker ON watchlist_history(ticker)",
     "CREATE INDEX IF NOT EXISTS idx_watchlist_date ON watchlist_history(analyzed_date)",
     "CREATE INDEX IF NOT EXISTS idx_watchlist_decision ON watchlist_history(decision)",
@@ -623,6 +653,7 @@ def create_all_tables(cursor, conn):
     tables = [
         TABLE_STOCK_HOLDINGS,
         TABLE_TRADING_HISTORY,
+        TABLE_DOMESTIC_PENDING_ORDERS,
         TABLE_WATCHLIST_HISTORY,
         TABLE_ANALYSIS_PERFORMANCE_TRACKER,
         TABLE_TRADING_JOURNAL,

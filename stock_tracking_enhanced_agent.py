@@ -12,7 +12,7 @@ import traceback
 import re
 
 from mcp_agent.workflows.llm.augmented_llm import RequestParams
-from cores.llm.openai_responses_llm import OpenAIResponsesLLM as OpenAIAugmentedLLM
+from cores.llm.trading_llm_selector import OpenAIAugmentedLLM, SELECTED_TRADING_LLM_BACKEND
 
 # Import core agents
 from cores.agents.trading_agents import create_sell_decision_agent
@@ -506,56 +506,96 @@ class EnhancedStockTrackingAgent(StockTrackingAgent):
 
                 # Process buy if entry decision
                 if decision == "Enter" and buy_score >= min_score and sector_diverse:
-                    # Process buy
-                    buy_success = await self.buy_stock(ticker, company_name, current_price, scenario, rank_change_msg)
+                    scenario = await self._prepare_buy_scenario(ticker, current_price, scenario)
+                    trade_result = {'success': False, 'message': 'Trading not executed'}
 
-                    if buy_success:
-                        # Call actual account trading function (async)
-                        from trading.domestic_stock_trading import AsyncTradingContext
-                        async with AsyncTradingContext() as trading:
-                            # Execute async buy with limit price for reserved orders
-                            trade_result = await trading.async_buy_stock(stock_code=ticker, limit_price=current_price)
-
-                        if trade_result['success']:
-                            logger.info(f"Actual purchase successful: {trade_result['message']}")
-                        else:
-                            logger.error(f"Actual purchase failed: {trade_result['message']}")
-
-                        # [Optional] Publish buy signal via Redis Streams
-                        # Auto-skipped if Redis not configured (requires UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN)
+                    if current_price > 0:
                         try:
-                            from messaging.redis_signal_publisher import publish_buy_signal
-                            await publish_buy_signal(
-                                ticker=ticker,
-                                company_name=company_name,
-                                price=current_price,
-                                scenario=scenario,
-                                source="AI Analysis",
-                                trade_result=trade_result
-                            )
-                        except Exception as signal_err:
-                            logger.warning(f"Buy signal publish failed (non-critical): {signal_err}")
+                            # Call actual account trading function (async)
+                            from trading.domestic_stock_trading import AsyncTradingContext
+                            async with AsyncTradingContext() as trading:
+                                # Execute async buy with limit price for reserved orders
+                                trade_result = await trading.async_buy_stock(stock_code=ticker, limit_price=current_price)
 
-                        # [Optional] Publish buy signal via GCP Pub/Sub
-                        # Auto-skipped if GCP not configured (requires GCP_PROJECT_ID, GCP_PUBSUB_TOPIC_ID)
-                        try:
-                            from messaging.gcp_pubsub_signal_publisher import publish_buy_signal as gcp_publish_buy_signal
-                            await gcp_publish_buy_signal(
-                                ticker=ticker,
-                                company_name=company_name,
-                                price=current_price,
-                                scenario=scenario,
-                                source="AI Analysis",
-                                trade_result=trade_result
-                            )
-                        except Exception as signal_err:
-                            logger.warning(f"GCP buy signal publish failed (non-critical): {signal_err}")
-
-                    if buy_success:
-                        buy_count += 1
-                        logger.info(f"Purchase complete: {company_name}({ticker}) @ {current_price:,.0f} KRW")
+                            if trade_result.get('success'):
+                                logger.info(f"KIS buy request accepted: {trade_result.get('message')}")
+                            else:
+                                logger.error(f"Actual purchase failed: {trade_result.get('message')}")
+                        except Exception as trade_err:
+                            logger.warning(f"Trading execution skipped: {trade_err}")
+                            trade_result = {'success': False, 'message': str(trade_err)}
                     else:
-                        logger.warning(f"Purchase failed: {company_name}({ticker})")
+                        logger.warning(f"Skipping actual purchase for {ticker}: invalid current_price ({current_price})")
+                        trade_result = {'success': False, 'message': f'Invalid current_price ({current_price})'}
+
+                    is_non_filled = self._is_non_filled_buy_result(trade_result)
+                    trade_actually_succeeded = bool(
+                        (trade_result.get('success') or trade_result.get('partial_success'))
+                        and not is_non_filled
+                    )
+
+                    if trade_actually_succeeded:
+                        buy_success = await self.buy_stock(ticker, company_name, current_price, scenario, rank_change_msg)
+
+                        if buy_success:
+                            # [Optional] Publish buy signal via Redis Streams
+                            # Auto-skipped if Redis not configured (requires UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN)
+                            try:
+                                from messaging.redis_signal_publisher import publish_buy_signal
+                                await publish_buy_signal(
+                                    ticker=ticker,
+                                    company_name=company_name,
+                                    price=current_price,
+                                    scenario=scenario,
+                                    source="AI Analysis",
+                                    trade_result=trade_result
+                                )
+                            except Exception as signal_err:
+                                logger.warning(f"Buy signal publish failed (non-critical): {signal_err}")
+
+                            # [Optional] Publish buy signal via GCP Pub/Sub
+                            # Auto-skipped if GCP not configured (requires GCP_PROJECT_ID, GCP_PUBSUB_TOPIC_ID)
+                            try:
+                                from messaging.gcp_pubsub_signal_publisher import publish_buy_signal as gcp_publish_buy_signal
+                                await gcp_publish_buy_signal(
+                                    ticker=ticker,
+                                    company_name=company_name,
+                                    price=current_price,
+                                    scenario=scenario,
+                                    source="AI Analysis",
+                                    trade_result=trade_result
+                                )
+                            except Exception as signal_err:
+                                logger.warning(f"GCP buy signal publish failed (non-critical): {signal_err}")
+
+                            buy_count += 1
+                            logger.info(f"Purchase complete: {company_name}({ticker}) @ {current_price:,.0f} KRW")
+                        else:
+                            logger.warning(f"Purchase record failed after KIS order success: {company_name}({ticker})")
+                    elif trade_result.get('success') and is_non_filled:
+                        logger.info(
+                            f"Buy reserved/queued, not recorded as holding yet: {company_name}({ticker}) - "
+                            f"{trade_result.get('message')}"
+                        )
+                        self._record_pending_buy_order(
+                            ticker=ticker,
+                            company_name=company_name,
+                            current_price=current_price,
+                            scenario=scenario,
+                            trade_result=trade_result,
+                        )
+                        self._append_pending_buy_message(
+                            ticker=ticker,
+                            company_name=company_name,
+                            current_price=current_price,
+                            scenario=scenario,
+                            trade_result=trade_result,
+                        )
+                    else:
+                        logger.warning(
+                            f"Purchase not recorded: {company_name}({ticker}) - "
+                            f"KIS order failed: {trade_result.get('message', 'Unknown')}"
+                        )
 
             logger.info(f"Report processing complete - Purchased: {buy_count} items, Sold: {sell_count} items")
             return buy_count, sell_count
@@ -565,21 +605,26 @@ class EnhancedStockTrackingAgent(StockTrackingAgent):
             logger.error(traceback.format_exc())
             return 0, 0
 
+    async def _prepare_buy_scenario(self, ticker: str, current_price: float, scenario: Dict[str, Any]) -> Dict[str, Any]:
+        """Fill dynamic target/stop values before sending a real order."""
+        if scenario.get('target_price', 0) <= 0:
+            target_price = await self._dynamic_target_price(ticker, current_price)
+            scenario['target_price'] = target_price
+            logger.info(f"{ticker} Dynamic target price calculated: {target_price:,.0f} KRW")
+
+        if scenario.get('stop_loss', 0) <= 0:
+            stop_loss = await self._dynamic_stop_loss(ticker, current_price)
+            scenario['stop_loss'] = stop_loss
+            logger.info(f"{ticker} Dynamic stop-loss calculated: {stop_loss:,.0f} KRW")
+
+        return scenario
+
     async def buy_stock(self, ticker: str, company_name: str, current_price: float, scenario: Dict[str, Any], rank_change_msg: str = "") -> bool:
         """
         Stock buy processing (override parent class method)
         """
         try:
-            # Calculate dynamically if target price/stop-loss is missing or 0 in scenario
-            if scenario.get('target_price', 0) <= 0:
-                target_price = await self._dynamic_target_price(ticker, current_price)
-                scenario['target_price'] = target_price
-                logger.info(f"{ticker} Dynamic target price calculated: {target_price:,.0f} KRW")
-
-            if scenario.get('stop_loss', 0) <= 0:
-                stop_loss = await self._dynamic_stop_loss(ticker, current_price)
-                scenario['stop_loss'] = stop_loss
-                logger.info(f"{ticker} Dynamic stop-loss calculated: {stop_loss:,.0f} KRW")
+            await self._prepare_buy_scenario(ticker, current_price, scenario)
 
             # Call parent class's buy_stock method
             return await super().buy_stock(ticker, company_name, current_price, scenario, rank_change_msg)

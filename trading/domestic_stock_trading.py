@@ -718,6 +718,9 @@ class DomesticStockTrading:
                     'order_no': order_no,
                     'stock_code': stock_code,
                     'quantity': buy_quantity,
+                    'order_status': 'reserved',
+                    'is_reserved_order': True,
+                    'filled': False,
                     'order_type': order_type_str,
                     'period_type': period_str,
                     'message': f'Reserved buy order completed ({buy_quantity} shares, {order_type_str}, {period_str})'
@@ -1058,6 +1061,9 @@ class DomesticStockTrading:
                     'order_no': order_no,
                     'stock_code': stock_code,
                     'quantity': buy_quantity,
+                    'order_status': 'reserved',
+                    'is_reserved_order': True,
+                    'filled': False,
                     'order_type': order_type_str,
                     'period_type': period_str,
                     'message': f'Reserved sell order completed ({buy_quantity} shares, {order_type_str}, {period_str})'
@@ -1199,7 +1205,18 @@ class DomesticStockTrading:
                         if buy_result['success']:
                             result['success'] = True
                             result['order_no'] = buy_result['order_no']
-                            result['message'] = f"Buy completed: {buy_quantity} shares x {current_price_info['current_price']:,} KRW = {result['total_amount']:,} KRW"
+                            result['order_status'] = buy_result.get('order_status', 'submitted')
+                            result['is_reserved_order'] = bool(buy_result.get('is_reserved_order', False))
+                            result['filled'] = bool(buy_result.get('filled', not result['is_reserved_order']))
+                            result['order_type'] = buy_result.get('order_type', '')
+                            result['period_type'] = buy_result.get('period_type', '')
+                            if result['is_reserved_order']:
+                                result['message'] = buy_result.get(
+                                    'message',
+                                    f"Reserved buy order accepted: {buy_quantity} shares x {current_price_info['current_price']:,} KRW"
+                                )
+                            else:
+                                result['message'] = f"Buy completed: {buy_quantity} shares x {current_price_info['current_price']:,} KRW = {result['total_amount']:,} KRW"
                             logger.info(f"[Async Buy API] {stock_code} buy successful")
                         else:
                             result['message'] = f"Buy failed: {buy_result['message']}"

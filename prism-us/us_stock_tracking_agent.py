@@ -68,13 +68,14 @@ from mcp_agent.app import MCPApp
 from mcp_agent.workflows.llm.augmented_llm import RequestParams
 import importlib.util as _ilu
 _spec = _ilu.spec_from_file_location(
-    "openai_responses_llm",
-    Path(__file__).resolve().parent.parent / "cores" / "llm" / "openai_responses_llm.py",
+    "trading_llm_selector",
+    Path(__file__).resolve().parent.parent / "cores" / "llm" / "trading_llm_selector.py",
 )
 assert _spec is not None and _spec.loader is not None
 _mod = _ilu.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)  # type: ignore[union-attr]
-OpenAIAugmentedLLM = _mod.OpenAIResponsesLLM
+OpenAIAugmentedLLM = _mod.OpenAIAugmentedLLM
+SELECTED_TRADING_LLM_BACKEND = _mod.SELECTED_TRADING_LLM_BACKEND
 del _ilu, _spec, _mod
 
 # Import US-specific modules
@@ -856,6 +857,44 @@ class USStockTrackingAgent:
             analysis_result.get("sector", "Unknown")
         )
         return analysis_result
+
+    def _is_non_filled_buy_result(self, trade_result: Dict[str, Any]) -> bool:
+        """Return True when KIS accepted/queued an order but no real fill is confirmed yet."""
+        order_type = str(trade_result.get("order_type", "")).lower()
+        order_no = str(trade_result.get("order_no", ""))
+        message = str(trade_result.get("message", "")).lower()
+        return (
+            order_type.startswith("queued_")
+            or order_type in {"reserved_limit", "reserved_buy", "reserved_sell"}
+            or order_no.startswith("PENDING-")
+            or "reserved" in message
+            or "queued" in message
+        )
+
+    def _append_pending_buy_message(
+        self,
+        ticker: str,
+        company_name: str,
+        current_price: float,
+        scenario: Dict[str, Any],
+        trade_result: Dict[str, Any],
+    ) -> None:
+        """Notify that a buy is pending/reserved without recording it as a holding."""
+        target_price = scenario.get('target_price', 0)
+        stop_loss = scenario.get('stop_loss', 0)
+        quantity = trade_result.get('quantity')
+        qty_text = f"{quantity} shares" if quantity else "quantity pending"
+        message = (
+            f"⏳ US Buy Pending/Reserved: {company_name}({ticker})\n"
+            f"Reference Price: ${current_price:,.2f}\n"
+            f"Target: ${target_price:,.2f}\n"
+            f"Stop Loss: ${stop_loss:,.2f}\n"
+            f"Order: {qty_text} / {trade_result.get('message', 'Reserved or queued')}\n"
+            "Note: This is not recorded as an actual holding until a real fill/holding is confirmed.\n"
+            f"Rationale: {scenario.get('rationale', 'No information')}"
+        )
+        self._msg_types.append("analysis")
+        self.message_queue.append(message)
 
     async def buy_stock(self, ticker: str, company_name: str, current_price: float,
                         scenario: Dict[str, Any], rank_change_msg: str = "") -> bool:
@@ -2238,45 +2277,41 @@ Use yahoo_finance and sqlite tools to check latest data, then decide whether to 
                         logger.info(f"Scenario rationale ({company_name}/{ticker}): {rationale[:300]}")
 
                     if normalized_decision == "entry" and adjusted_score >= min_score and sector_diverse:
-                        buy_success = await self.buy_stock(ticker, company_name, current_price, scenario, rank_change_msg)
+                        trade_result = {'success': False, 'message': 'Trading not executed'}
 
-                        if buy_success:
-                            trade_result = {'success': False, 'message': 'Trading not executed'}
-
-                            if current_price > 0:
+                        if current_price > 0:
+                            try:
                                 try:
-                                    try:
-                                        from trading.us_stock_trading import AsyncUSTradingContext
-                                    except ImportError:
-                                        from prism_us.trading.us_stock_trading import AsyncUSTradingContext
-                                    async with AsyncUSTradingContext(account_name=account["name"]) as trading:
-                                        trade_result = await trading.async_buy_stock(ticker=ticker, limit_price=current_price)
+                                    from trading.us_stock_trading import AsyncUSTradingContext
+                                except ImportError:
+                                    from prism_us.trading.us_stock_trading import AsyncUSTradingContext
+                                async with AsyncUSTradingContext(account_name=account["name"]) as trading:
+                                    trade_result = await trading.async_buy_stock(ticker=ticker, limit_price=current_price)
 
-                                    if trade_result['success']:
-                                        logger.info(f"Actual purchase successful: {trade_result['message']}")
-                                    else:
-                                        logger.error(f"Actual purchase failed: {trade_result['message']}")
-                                except Exception as trade_err:
-                                    logger.warning(f"Trading execution skipped: {trade_err}")
-                            else:
-                                logger.warning(f"Skipping actual purchase for {ticker}: invalid current_price ({current_price})")
+                                if trade_result.get('success'):
+                                    logger.info(f"KIS buy request accepted: {trade_result.get('message')}")
+                                else:
+                                    logger.error(f"Actual purchase failed: {trade_result.get('message')}")
+                            except Exception as trade_err:
+                                logger.warning(f"Trading execution skipped: {trade_err}")
+                                trade_result = {'success': False, 'message': str(trade_err)}
+                        else:
+                            logger.warning(f"Skipping actual purchase for {ticker}: invalid current_price ({current_price})")
+                            trade_result = {'success': False, 'message': f'Invalid current_price ({current_price})'}
 
-                            # Simulator DB record (inserted by buy_stock) is independent of KIS result.
-                            # KIS failure only affects real-money execution — the simulator holding stays.
-                            trade_actually_succeeded = trade_result.get('success') or trade_result.get('partial_success')
+                        is_non_filled = self._is_non_filled_buy_result(trade_result)
+                        trade_actually_succeeded = bool(
+                            (trade_result.get('success') or trade_result.get('partial_success'))
+                            and not is_non_filled
+                        )
 
-                            # Simulator state: always update when buy_stock() succeeded,
-                            # regardless of KIS result (simulator and real trading are independent).
-                            buy_count += 1
-                            state["traded"] = True
+                        if trade_actually_succeeded:
+                            buy_success = await self.buy_stock(ticker, company_name, current_price, scenario, rank_change_msg)
 
-                            if not trade_actually_succeeded:
-                                logger.warning(
-                                    f"[{ticker}] KIS order failed: {trade_result.get('message', 'Unknown')} "
-                                    f"— simulator holding preserved, no skip notification"
-                                )
-                                logger.info(f"Simulator purchase recorded: {company_name} ({ticker}) @ ${current_price:.2f} (KIS order failed)")
-                            else:
+                            if buy_success:
+                                buy_count += 1
+                                state["traded"] = True
+
                                 if trade_result.get("partial_success"):
                                     successful = trade_result.get("successful_accounts", [])
                                     failed = trade_result.get("failed_accounts", [])
@@ -2316,10 +2351,31 @@ Use yahoo_finance and sqlite tools to check latest data, then decide whether to 
                                     signaled_tickers.add(ticker)
 
                                 logger.info(f"Purchase complete: {company_name} ({ticker}) @ ${current_price:.2f}")
+                            else:
+                                state["should_save_watchlist"] = True
+                                state["skip_reason"] = state["skip_reason"] or "Holding record failed after KIS order success"
+                                logger.warning(f"Purchase record failed after KIS order success: {company_name} ({ticker})")
+                        elif trade_result.get('success') and is_non_filled:
+                            # Reserved/queued orders are not real holdings yet. They will be handled
+                            # by pending-order processing and later holdings reconciliation.
+                            state["pending"] = True
+                            state["should_save_watchlist"] = False
+                            logger.info(
+                                f"Buy reserved/queued, not recorded as holding yet: {company_name} ({ticker}) - "
+                                f"{trade_result.get('message')}"
+                            )
+                            self._append_pending_buy_message(
+                                ticker=ticker,
+                                company_name=company_name,
+                                current_price=current_price,
+                                scenario=scenario,
+                                trade_result=trade_result,
+                            )
                         else:
+                            reason = f"KIS order failed: {trade_result.get('message', 'Unknown')}"
                             state["should_save_watchlist"] = True
-                            state["skip_reason"] = state["skip_reason"] or "Purchase failed"
-                            logger.warning(f"Purchase failed: {company_name} ({ticker})")
+                            state["skip_reason"] = state["skip_reason"] or reason
+                            logger.warning(f"Purchase not recorded: {company_name} ({ticker}) - {reason}")
                     else:
                         # Build a single reason string that lists ALL applicable causes,
                         # so the displayed reason matches the AI rationale shown in the
