@@ -9,19 +9,198 @@ Uses yfinance for market data access.
 
 import datetime
 import logging
+import os
 import pandas as pd
 import numpy as np
 import yfinance as yf
 import sys
+import time
 from pathlib import Path
-from typing import Tuple, List
+from typing import Tuple, Optional, List
 
 # Import check_market_day functions for US holiday handling
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from check_market_day import get_last_trading_day, get_next_trading_day
+from check_market_day import get_last_trading_day, get_next_trading_day, is_us_market_day
 
 # Logger setup
 logger = logging.getLogger(__name__)
+
+# yfinance can open small SQLite cache files for cookies/timezones. Cron/launchd
+# environments often have a different HOME/XDG setup than an interactive shell,
+# and yfinance's parallel downloader may then emit noisy
+# "OperationalError: unable to open database file" failures. Pin the cache to a
+# project-local writable directory before any download calls.
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+YFINANCE_CACHE_DIR = PROJECT_ROOT / ".cache" / "yfinance"
+YFINANCE_BATCH_SIZE = int(os.getenv("PRISM_US_YF_BATCH_SIZE", "50"))
+YFINANCE_RETRIES = int(os.getenv("PRISM_US_YF_RETRIES", "2"))
+YFINANCE_RETRY_SLEEP_SECONDS = float(os.getenv("PRISM_US_YF_RETRY_SLEEP_SECONDS", "1.0"))
+YFINANCE_MIN_COVERAGE = float(os.getenv("PRISM_US_YF_MIN_COVERAGE", "0.80"))
+
+
+def _configure_yfinance_cache() -> None:
+    """Use a stable, writable yfinance cache location for scheduled batches."""
+    try:
+        YFINANCE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        os.environ.setdefault("XDG_CACHE_HOME", str(PROJECT_ROOT / ".cache"))
+        if hasattr(yf, "set_tz_cache_location"):
+            yf.set_tz_cache_location(str(YFINANCE_CACHE_DIR))
+        try:
+            import yfinance.cache as yf_cache
+            if hasattr(yf_cache, "set_cache_location"):
+                yf_cache.set_cache_location(str(YFINANCE_CACHE_DIR))
+        except Exception as cache_error:
+            logger.debug(f"Unable to set yfinance.cache location: {cache_error}")
+        test_file = YFINANCE_CACHE_DIR / ".write_test"
+        test_file.write_text("ok", encoding="utf-8")
+        test_file.unlink(missing_ok=True)
+        logger.debug(f"yfinance cache directory: {YFINANCE_CACHE_DIR}")
+    except Exception as e:
+        logger.error(f"Failed to initialize yfinance cache directory {YFINANCE_CACHE_DIR}: {e}")
+        raise
+
+
+_configure_yfinance_cache()
+
+
+def _ticker_chunks(tickers: List[str], size: int = YFINANCE_BATCH_SIZE):
+    """Yield non-empty ticker chunks while preserving order."""
+    for i in range(0, len(tickers), size):
+        chunk = tickers[i:i + size]
+        if chunk:
+            yield chunk
+
+
+def _download_ohlcv_batch(tickers: List[str], start: str, end: str) -> pd.DataFrame:
+    """Download one yfinance chunk with conservative concurrency settings."""
+    return yf.download(
+        tickers,
+        start=start,
+        end=end,
+        progress=False,
+        threads=False,
+        group_by="column",
+    )
+
+
+def _extract_rows_for_date(data: pd.DataFrame, tickers: List[str], target_date: str,
+                           label: str) -> Tuple[pd.DataFrame, str]:
+    """Extract one OHLCV row per ticker for target_date from a yf.download result."""
+    if data is None or data.empty:
+        return pd.DataFrame(), ""
+
+    available_dates = data.index.strftime('%Y%m%d').tolist()
+    if target_date not in available_dates:
+        logger.warning(
+            f"{label}: target date {target_date} not available in yfinance response "
+            f"(available: {available_dates[-3:] if available_dates else []})"
+        )
+        return pd.DataFrame(), ""
+
+    target_idx = data.index[available_dates.index(target_date)]
+    rows = []
+
+    if isinstance(data.columns, pd.MultiIndex):
+        for ticker in tickers:
+            try:
+                row = {
+                    'Ticker': ticker,
+                    'Open': data.loc[target_idx, ('Open', ticker)],
+                    'High': data.loc[target_idx, ('High', ticker)],
+                    'Low': data.loc[target_idx, ('Low', ticker)],
+                    'Close': data.loc[target_idx, ('Close', ticker)],
+                    'Volume': data.loc[target_idx, ('Volume', ticker)],
+                }
+                rows.append(row)
+            except Exception:
+                continue
+    elif len(tickers) == 1:
+        ticker = tickers[0]
+        try:
+            row = {
+                'Ticker': ticker,
+                'Open': data.loc[target_idx, 'Open'],
+                'High': data.loc[target_idx, 'High'],
+                'Low': data.loc[target_idx, 'Low'],
+                'Close': data.loc[target_idx, 'Close'],
+                'Volume': data.loc[target_idx, 'Volume'],
+            }
+            rows.append(row)
+        except Exception:
+            pass
+
+    snapshot = pd.DataFrame(rows)
+    if snapshot.empty:
+        return snapshot, target_date
+
+    snapshot = snapshot.set_index('Ticker')
+    snapshot['Amount'] = snapshot['Close'] * snapshot['Volume']
+    snapshot = snapshot.dropna()
+    snapshot = snapshot[(snapshot['Close'] > 0) & (snapshot['Volume'] >= 0)]
+    return snapshot, target_date
+
+
+def _download_snapshot_with_retries(tickers: List[str], start_date: datetime.date,
+                                    target_date: datetime.date, label: str) -> pd.DataFrame:
+    """Chunked yfinance OHLCV retrieval with retry and fail-closed coverage gate."""
+    target_str = target_date.strftime('%Y%m%d')
+    start_str = start_date.strftime('%Y-%m-%d')
+    end_str = (target_date + datetime.timedelta(days=1)).strftime('%Y-%m-%d')
+    expected = len(tickers)
+    collected = []
+    remaining = list(dict.fromkeys(tickers))
+
+    for attempt in range(YFINANCE_RETRIES + 1):
+        if not remaining:
+            break
+        attempt_rows = []
+        logger.info(
+            f"{label}: yfinance download attempt {attempt + 1}/{YFINANCE_RETRIES + 1} "
+            f"for {len(remaining)} ticker(s), chunk_size={YFINANCE_BATCH_SIZE}"
+        )
+        for chunk in _ticker_chunks(remaining):
+            try:
+                data = _download_ohlcv_batch(chunk, start_str, end_str)
+                rows, _ = _extract_rows_for_date(data, chunk, target_str, label)
+                if not rows.empty:
+                    attempt_rows.append(rows)
+            except Exception as e:
+                logger.warning(f"{label}: yfinance chunk failed ({len(chunk)} tickers): {e}")
+
+        if attempt_rows:
+            attempt_df = pd.concat(attempt_rows)
+            collected.append(attempt_df)
+            found = set(pd.concat(collected).index.tolist())
+            remaining = [ticker for ticker in tickers if ticker not in found]
+            logger.info(
+                f"{label}: retrieved {len(found)}/{expected} ticker(s); "
+                f"remaining={len(remaining)}"
+            )
+
+        if remaining and attempt < YFINANCE_RETRIES:
+            time.sleep(YFINANCE_RETRY_SLEEP_SECONDS * (attempt + 1))
+
+    if not collected:
+        raise ValueError(f"{label}: No OHLCV data for {target_str}")
+
+    snapshot = pd.concat(collected)
+    snapshot = snapshot[~snapshot.index.duplicated(keep='first')]
+    coverage = len(snapshot) / expected if expected else 1.0
+    failed = [ticker for ticker in tickers if ticker not in set(snapshot.index)]
+    if failed:
+        logger.warning(
+            f"{label}: {len(failed)} ticker(s) missing after retries "
+            f"(coverage={coverage:.1%}); sample={failed[:20]}"
+        )
+
+    if coverage < YFINANCE_MIN_COVERAGE:
+        raise ValueError(
+            f"{label}: yfinance coverage {coverage:.1%} below fail-closed threshold "
+            f"{YFINANCE_MIN_COVERAGE:.0%} ({len(snapshot)}/{expected})"
+        )
+
+    logger.info(f"{label}: final yfinance coverage {coverage:.1%} ({len(snapshot)}/{expected})")
+    return snapshot
 
 
 def get_sp500_tickers() -> List[str]:
@@ -125,7 +304,7 @@ def get_snapshot(trade_date: str, tickers: List[str] = None) -> pd.DataFrame:
         tickers: List of ticker symbols (default: S&P 500)
 
     Returns:
-        DataFrame with columns: Open, High, Low, Close, Volume
+        DataFrame with columns: Open, High, Low, Close, Volume, Amount
         Index: Ticker symbols
     """
     logger.debug(f"get_snapshot called: {trade_date}")
@@ -133,78 +312,24 @@ def get_snapshot(trade_date: str, tickers: List[str] = None) -> pd.DataFrame:
     if tickers is None:
         tickers = get_sp500_tickers()
 
-    # Convert date format
-    date_str = f"{trade_date[:4]}-{trade_date[4:6]}-{trade_date[6:]}"
-    end_date = datetime.datetime.strptime(trade_date, '%Y%m%d')
+    end_date = datetime.datetime.strptime(trade_date, '%Y%m%d').date()
     start_date = end_date - datetime.timedelta(days=5)  # Get a few days for safety
 
     try:
-        # Download data for all tickers at once (more efficient)
-        data = yf.download(
-            tickers,
-            start=start_date.strftime('%Y-%m-%d'),
-            end=(end_date + datetime.timedelta(days=1)).strftime('%Y-%m-%d'),
-            progress=False,
-            threads=True
+        snapshot = _download_snapshot_with_retries(
+            tickers=tickers,
+            start_date=start_date,
+            target_date=end_date,
+            label=f"snapshot[{trade_date}]",
         )
-
-        if data.empty:
-            logger.error(f"No OHLCV data for {trade_date}")
-            raise ValueError(f"No OHLCV data for {trade_date}")
-
-        # Get the specific date's data
-        if isinstance(data.columns, pd.MultiIndex):
-            # Multiple tickers case
-            rows = []
-
-            # Try to get exact date or nearest available date
-            available_dates = data.index.strftime('%Y%m%d').tolist()
-            if trade_date in available_dates:
-                target_idx = data.index[available_dates.index(trade_date)]
-            else:
-                # Find nearest date
-                target_idx = data.index[-1]
-                logger.warning(f"Date {trade_date} not found, using {target_idx.strftime('%Y%m%d')}")
-
-            for ticker in tickers:
-                try:
-                    row = {
-                        'Ticker': ticker,
-                        'Open': data.loc[target_idx, ('Open', ticker)],
-                        'High': data.loc[target_idx, ('High', ticker)],
-                        'Low': data.loc[target_idx, ('Low', ticker)],
-                        'Close': data.loc[target_idx, ('Close', ticker)],
-                        'Volume': data.loc[target_idx, ('Volume', ticker)],
-                    }
-                    rows.append(row)
-                except Exception:
-                    continue
-
-            # Create DataFrame from collected rows
-            snapshot = pd.DataFrame(rows)
-            if not snapshot.empty:
-                snapshot = snapshot.set_index('Ticker')
-                # Calculate Amount (trade value) = Close * Volume
-                snapshot['Amount'] = snapshot['Close'] * snapshot['Volume']
-
-        else:
-            # Single ticker case
-            snapshot = data.loc[[data.index[-1]]].copy()
-            snapshot.index = [tickers[0]]
-            snapshot['Amount'] = snapshot['Close'] * snapshot['Volume']
-
-        # Remove rows with NaN values
-        snapshot = snapshot.dropna()
 
         logger.debug(f"Snapshot data sample:\n{snapshot.head()}")
         logger.info(f"Retrieved snapshot for {len(snapshot)} tickers")
-
         return snapshot
 
     except Exception as e:
         logger.error(f"Error getting snapshot: {e}")
         raise ValueError(f"Failed to get snapshot for {trade_date}: {e}")
-
 
 def get_previous_snapshot(trade_date: str, tickers: List[str] = None) -> Tuple[pd.DataFrame, str]:
     """
@@ -220,75 +345,29 @@ def get_previous_snapshot(trade_date: str, tickers: List[str] = None) -> Tuple[p
     if tickers is None:
         tickers = get_sp500_tickers()
 
-    # Calculate previous trading day using US market calendar
-    # This handles both weekends AND US market holidays (MLK Day, etc.)
+    # Calculate previous trading day using US market calendar.
     date_obj = datetime.datetime.strptime(trade_date, '%Y%m%d').date()
-    # get_last_trading_day returns the trading day ON OR BEFORE the given date
-    # So we pass (trade_date - 1) to get the PREVIOUS trading day
     prev_date_obj = get_last_trading_day(date_obj - datetime.timedelta(days=1))
-
     prev_date = prev_date_obj.strftime('%Y%m%d')
     logger.info(f"Previous snapshot: trade_date={trade_date}, prev_trading_day={prev_date}")
 
-    # Get data for previous 7 days to ensure we get a trading day
     start_date = prev_date_obj - datetime.timedelta(days=7)
 
     try:
-        # IMPORTANT: yfinance end parameter is EXCLUSIVE
-        # So we need to add 1 day to include prev_date_obj in the results
-        data = yf.download(
-            tickers,
-            start=start_date.strftime('%Y-%m-%d'),
-            end=(prev_date_obj + datetime.timedelta(days=1)).strftime('%Y-%m-%d'),
-            progress=False,
-            threads=True
+        snapshot = _download_snapshot_with_retries(
+            tickers=tickers,
+            start_date=start_date,
+            target_date=prev_date_obj,
+            label=f"previous_snapshot[{prev_date}]",
         )
 
-        if data.empty:
-            logger.error("No previous snapshot data")
-            raise ValueError(f"No previous snapshot data for {prev_date}")
-
-        # Get the last available date before trade_date
-        if isinstance(data.columns, pd.MultiIndex):
-            rows = []
-            target_idx = data.index[-1]
-            actual_date = target_idx.strftime('%Y%m%d')
-
-            for ticker in tickers:
-                try:
-                    row = {
-                        'Ticker': ticker,
-                        'Open': data.loc[target_idx, ('Open', ticker)],
-                        'High': data.loc[target_idx, ('High', ticker)],
-                        'Low': data.loc[target_idx, ('Low', ticker)],
-                        'Close': data.loc[target_idx, ('Close', ticker)],
-                        'Volume': data.loc[target_idx, ('Volume', ticker)],
-                    }
-                    rows.append(row)
-                except Exception:
-                    continue
-
-            snapshot = pd.DataFrame(rows)
-            if not snapshot.empty:
-                snapshot = snapshot.set_index('Ticker')
-                snapshot['Amount'] = snapshot['Close'] * snapshot['Volume']
-        else:
-            snapshot = data.loc[[data.index[-1]]].copy()
-            snapshot.index = [tickers[0]]
-            snapshot['Amount'] = snapshot['Close'] * snapshot['Volume']
-            actual_date = data.index[-1].strftime('%Y%m%d')
-
-        snapshot = snapshot.dropna()
-
-        logger.debug(f"Previous trading day: {actual_date}")
+        logger.debug(f"Previous trading day: {prev_date}")
         logger.info(f"Retrieved previous snapshot for {len(snapshot)} tickers")
-
-        return snapshot, actual_date
+        return snapshot, prev_date
 
     except Exception as e:
         logger.error(f"Error getting previous snapshot: {e}")
         raise ValueError(f"Failed to get previous snapshot: {e}")
-
 
 def get_multi_day_ohlcv(ticker: str, end_date: str, days: int = 10) -> pd.DataFrame:
     """
@@ -310,7 +389,8 @@ def get_multi_day_ohlcv(ticker: str, end_date: str, days: int = 10) -> pd.DataFr
             ticker,
             start=start_dt.strftime('%Y-%m-%d'),
             end=(end_dt + datetime.timedelta(days=1)).strftime('%Y-%m-%d'),
-            progress=False
+            progress=False,
+            threads=False
         )
 
         if data.empty:

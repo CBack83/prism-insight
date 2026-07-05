@@ -74,6 +74,20 @@ TRIGGER_CRITERIA = {
 # Trading value filter: $100M USD
 MIN_TRADING_VALUE = 100_000_000
 
+# Fail-closed: downstream report/trading expects three fresh candidates. If the
+# trigger stage cannot produce three candidates from current OHLCV data, stop
+# before report generation, Telegram, or orders.
+MIN_FINAL_SELECTIONS = int(os.getenv("PRISM_US_MIN_FINAL_SELECTIONS", "3"))
+
+
+def _count_final_results(final_results: dict) -> int:
+    """Count unique tickers in final trigger results."""
+    selected = set()
+    for stocks_df in final_results.values():
+        if stocks_df is not None and not stocks_df.empty:
+            selected.update(stocks_df.index.tolist())
+    return len(selected)
+
 
 def calculate_agent_fit_metrics(ticker: str, current_price: float, trade_date: str,
                                 lookback_days: int = 10, trigger_type: str = None) -> dict:
@@ -1267,6 +1281,12 @@ def run_batch(trigger_time: str, log_level: str = "INFO", output_file: str = Non
 
     # Final selection
     final_results = select_final_tickers(triggers, trade_date=trade_date, macro_context=macro_context)
+    final_count = _count_final_results(final_results)
+    if final_count < MIN_FINAL_SELECTIONS:
+        raise RuntimeError(
+            f"Fail-closed: only {final_count}/{MIN_FINAL_SELECTIONS} US candidates selected "
+            f"from fresh yfinance data; stop before report/trading stages"
+        )
 
     # Save to JSON if requested
     if output_file:
