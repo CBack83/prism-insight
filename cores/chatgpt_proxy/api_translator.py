@@ -86,7 +86,7 @@ def translate_request(body: dict) -> dict:
 
     Key mappings:
     - messages -> input (with role translations)
-    - max_tokens -> max_output_tokens
+    - max_tokens -> omitted (Codex ChatGPT backend rejects max_output_tokens)
     - tools[].function.* -> tools[].* (flattened)
     - response_format -> text.format
     """
@@ -113,9 +113,8 @@ def translate_request(body: dict) -> dict:
     if reasoning_effort and reasoning_effort != "none":
         translated["reasoning"] = {"effort": reasoning_effort}
 
-    # max_tokens -> max_output_tokens
-    if "max_tokens" in body:
-        translated["max_output_tokens"] = body["max_tokens"]
+    # The ChatGPT Codex backend rejects max_output_tokens, so intentionally
+    # omit Chat Completions max_tokens instead of translating it.
 
     # Tools (flatten nested function structure)
     if body.get("tools"):
