@@ -225,6 +225,68 @@ class CompressionManager:
             logger.error(f"Error in Layer 3 compression: {e}")
             return {"processed": len(entries), "compressed": 0, "intuitions_generated": 0, "errors": [str(e)]}
 
+    async def refresh_intuitions(self, window_days: int = 90, limit: int = 40,
+                                 min_entries: int = 5) -> Dict[str, Any]:
+        """누적 코퍼스 기반 직관 재추출.
+
+        기존 layer2→3 압축은 '30일 지난 소량 배치(주당 2~7건)'만 LLM에 먹여
+        '2회 이상 반복 패턴' 조건이 거의 안 맞아 직관 생성이 2026-02 이후 멈췄다.
+        이 메서드는 압축과 별개로 최근 window_days 저널을 한 번에 LLM에 먹여 직관을
+        생성/갱신한다(_save_intuition 이 condition+insight 로 dedup). compression_layer
+        는 건드리지 않으며, 실패해도 압축 결과에 영향이 없도록 호출측에서 격리한다.
+        """
+        results = {"intuitions_generated": 0, "corpus": 0, "extracted": 0, "errors": []}
+        if not self.enable_journal:
+            results["skipped"] = True
+            return results
+        try:
+            from cores.agents.memory_compressor_agent import create_memory_compressor_agent
+            from mcp_agent.workflows.llm.augmented_llm import RequestParams
+            from mcp_agent.workflows.llm.augmented_llm_openai import OpenAIAugmentedLLM
+
+            cutoff = (datetime.now() - timedelta(days=window_days)).strftime("%Y-%m-%d")
+            self.cursor.execute("""
+                SELECT id, ticker, company_name, trade_date, profit_rate,
+                       COALESCE(compressed_summary, one_line_summary) AS compressed_summary,
+                       pattern_tags, buy_scenario
+                FROM trading_journal
+                WHERE trade_date >= ?
+                ORDER BY trade_date DESC
+                LIMIT ?
+            """, (cutoff, limit))
+            entries = [dict(zip([d[0] for d in self.cursor.description], row))
+                       for row in self.cursor.fetchall()]
+            results["corpus"] = len(entries)
+            if len(entries) < min_entries:
+                results["reason"] = "insufficient_corpus"
+                return results
+
+            compressor_agent = create_memory_compressor_agent(self.language)
+            async with compressor_agent:
+                llm = await compressor_agent.attach_llm(OpenAIAugmentedLLM)
+                entries_text = self._format_entries_for_intuition(entries)
+                prompt = self._build_layer3_prompt(entries_text, len(entries))
+                response = await llm.generate_str(
+                    message=prompt,
+                    request_params=RequestParams(model="gpt-5.4", reasoning_effort="none", maxTokens=8000)
+                )
+            data = self._parse_response(response)
+            new_intuitions = data.get('new_intuitions', [])
+            logger.info(f"[refresh_intuitions] extracted {len(new_intuitions)} intuitions "
+                        f"(keys={list(data.keys())})")
+            results["extracted"] = len(new_intuitions)
+            source_ids = [e['id'] for e in entries]
+            for intuition in new_intuitions:
+                if self._save_intuition(intuition, source_ids):
+                    results["intuitions_generated"] += 1
+            self.conn.commit()
+            return results
+        except Exception as e:
+            log_openai_error(logger, e, "intuition refresh")
+            logger.error(f"Error in intuition refresh: {e}")
+            results["errors"].append(str(e))
+            return results
+
     def _fetch_hindsight_prices(self, entries: List[Dict[str, Any]]) -> Dict[str, float]:
         """Fetch current prices for tickers to add hindsight context during compression.
 
@@ -379,7 +441,11 @@ Extract intuitions from these compressed records.
 4. Categorize by sector/market/pattern
 5. Include both failure and success patterns
 
-Please respond in JSON.
+## Output — respond with ONLY this JSON (exact key "new_intuitions"):
+{{"new_intuitions": [
+  {{"category": "pattern", "subcategory": "", "condition": "조건 요약(예: 변동성 높은 횡보장 단기 진입)", "insight": "행동 원칙(예: 추세 정렬·강세 regime 확인 전 추격 금지)", "confidence": 0.6, "supporting_trades": 2, "success_rate": 0.5}}
+]}}
+- 반복 테마가 보이면 최소 1~3개의 가장 뚜렷한 직관을 반드시 포함하라. 없으면 빈 배열.
 """
         else:
             return f"""
@@ -395,7 +461,11 @@ Extract intuitions from these compressed records.
 4. Categorize by sector/market/pattern
 5. Include failure and success patterns
 
-Respond in JSON.
+## Output — respond with ONLY this JSON (exact key "new_intuitions"):
+{{"new_intuitions": [
+  {{"category": "pattern", "subcategory": "", "condition": "e.g. short-term entry in a volatile chop", "insight": "e.g. require trend alignment + bullish regime before re-entry", "confidence": 0.6, "supporting_trades": 2, "success_rate": 0.5}}
+]}}
+- If a repeated theme is visible, include at least the 1-3 clearest intuitions. Otherwise return an empty array.
 """
 
     def _parse_response(self, response: str) -> Dict[str, Any]:

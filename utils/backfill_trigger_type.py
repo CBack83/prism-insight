@@ -159,7 +159,7 @@ def determine_trigger_info(
                     info = trigger_map[check_key]
                     logger.debug(f"[{ticker}] Found trigger match on {check_date} (original: {date_part})")
                     return info['trigger_type'], info['trigger_mode']
-        except:
+        except Exception:
             pass
 
     # 3. Fall back to text analysis from scenario
@@ -191,7 +191,7 @@ def determine_trigger_info(
                 trigger_type = 'News Catalyst'
             else:
                 trigger_type = 'Comprehensive Analysis'
-        except:
+        except Exception:
             pass
 
     # Determine trigger_mode from time if available
@@ -201,7 +201,7 @@ def determine_trigger_info(
             if time_part:
                 hour = int(time_part.split(':')[0])
                 trigger_mode = 'morning' if hour < 12 else 'afternoon'
-        except:
+        except Exception:
             pass
 
     return trigger_type, trigger_mode
@@ -400,12 +400,12 @@ def main():
         print("\n" + "=" * 60)
         print("Backfill Summary")
         print("=" * 60)
-        print(f"\nstock_holdings:")
+        print("\nstock_holdings:")
         print(f"  Total records:   {holdings_stats['total']}")
         print(f"  Updated:         {holdings_stats['updated']}")
         print(f"  Skipped:         {holdings_stats['skipped']}")
 
-        print(f"\ntrading_history:")
+        print("\ntrading_history:")
         print(f"  Total records:   {history_stats['total']}")
         print(f"  Updated:         {history_stats['updated']}")
         print(f"  Skipped:         {history_stats['skipped']}")
@@ -414,7 +414,7 @@ def main():
         if args.dry_run:
             print("\nTo execute backfill, run without --dry-run flag")
         else:
-            print(f"\nSuccessfully backfilled trigger_type data")
+            print("\nSuccessfully backfilled trigger_type data")
 
     finally:
         conn.close()

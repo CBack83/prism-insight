@@ -24,14 +24,13 @@ load_dotenv()
 import asyncio
 import json
 import logging
-import math
 import os
 import re
 import sqlite3
 import sys
 import traceback
 import importlib.util as _ilu
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Any, Tuple, Optional
 
@@ -51,6 +50,18 @@ if _error_spec and _error_spec.loader:
 
 from telegram import Bot
 from telegram.error import TelegramError
+
+# O'Neil 룰베이스 매도 fallback (2026-06-04 quota 사고 대응).
+# prism-us/cores 가 sys.path 우선이라 prism-us/cores/oneil_fallback 로 해석됨.
+# 방어적 import: 실패 시 _ONEIL_FALLBACK_AVAILABLE=False 로 기존 레거시 룰 유지.
+try:
+    from cores.oneil_fallback import (
+        evaluate_oneil_sell as _oneil_eval,
+        from_stock_data as _oneil_from,
+    )
+    _ONEIL_FALLBACK_AVAILABLE = True
+except Exception:  # pragma: no cover - defensive
+    _ONEIL_FALLBACK_AVAILABLE = False
 
 # Logging configuration
 logging.basicConfig(
@@ -132,6 +143,10 @@ try:
         migrate_us_watchlist_history_columns,
         is_us_ticker_in_holdings,
         get_us_holdings_count,
+        get_us_existing_position_for_ticker,
+        evaluate_us_pyramid_add_gate,
+        compute_us_fractional_sell_quantity,
+        decide_us_sell_plan,
     )
     from tracking.journal import USJournalManager
     from tracking.compression import USCompressionManager
@@ -151,6 +166,10 @@ except ImportError as e:
         migrate_us_watchlist_history_columns,
         is_us_ticker_in_holdings,
         get_us_holdings_count,
+        get_us_existing_position_for_ticker,
+        evaluate_us_pyramid_add_gate,
+        compute_us_fractional_sell_quantity,
+        decide_us_sell_plan,
     )
     from tracking.journal import USJournalManager
     from tracking.compression import USCompressionManager
@@ -212,23 +231,36 @@ async def get_current_stock_price(cursor, ticker: str, account_key: str | None =
     Returns:
         float: Current stock price in USD
     """
-    try:
-        import yfinance as yf
+    import asyncio
+    import yfinance as yf
 
-        stock = yf.Ticker(ticker)
-        info = stock.info
-        current_price = info.get('regularMarketPrice', 0) or info.get('previousClose', 0)
+    # yfinance can intermittently fail/throttle. Retry a few times before falling
+    # back, so a momentary blip does not silently drop a fresh buy candidate whose
+    # price is not yet in the DB (last-price fallback returns 0 → report skipped).
+    # Mirrors the KR tracking/helpers.py retry logic.
+    MAX_RETRIES = 3
+    for attempt in range(MAX_RETRIES):
+        try:
+            stock = yf.Ticker(ticker)
+            info = stock.info
+            current_price = info.get('regularMarketPrice', 0) or info.get('previousClose', 0)
 
-        if current_price > 0:
-            logger.info(f"{ticker} current price: ${current_price:.2f}")
-            return float(current_price)
-        else:
-            logger.warning(f"Cannot get price for {ticker}")
-            return _get_last_price_from_db(cursor, ticker, account_key=account_key)
+            if current_price > 0:
+                logger.info(f"{ticker} current price: ${current_price:.2f}")
+                return float(current_price)
+            else:
+                logger.warning(f"Cannot get price for {ticker}")
+                return _get_last_price_from_db(cursor, ticker, account_key=account_key)
 
-    except Exception as e:
-        logger.error(f"Error querying current price for {ticker}: {str(e)}")
-        return _get_last_price_from_db(cursor, ticker, account_key=account_key)
+        except Exception as e:
+            logger.error(f"Error querying current price for {ticker} "
+                         f"(attempt {attempt + 1}/{MAX_RETRIES}): {str(e)}")
+            if attempt < MAX_RETRIES - 1:
+                wait = 2 * (attempt + 1)  # 2s, 4s
+                logger.warning(f"{ticker} price query retry in {wait}s")
+                await asyncio.sleep(wait)
+            else:
+                return _get_last_price_from_db(cursor, ticker, account_key=account_key)
 
 
 def _get_last_price_from_db(cursor, ticker: str, account_key: str | None = None) -> float:
@@ -249,7 +281,7 @@ def _get_last_price_from_db(cursor, ticker: str, account_key: str | None = None)
             last_price = float(row[0])
             logger.warning(f"{ticker} price query failed, using last price: ${last_price:.2f}")
             return last_price
-    except:
+    except Exception:
         pass
     return 0.0
 
@@ -349,7 +381,7 @@ def check_sector_diversity(cursor, sector: str, max_same_sector: int, concentrat
                     scenario_data = json.loads(row[0])
                     if 'sector' in scenario_data:
                         sectors.append(scenario_data['sector'])
-                except:
+                except Exception:
                     pass
 
         same_sector_count = sum(1 for s in sectors if s and s.lower() == sector.lower())
@@ -409,7 +441,13 @@ def parse_price_value(value: Any) -> float:
 
 
 def default_scenario() -> Dict[str, Any]:
-    """Return default trading scenario for US stocks."""
+    """Return default trading scenario for US stocks.
+
+    NOTE: This is a *failure* sentinel, not a real trading decision. The
+    `analysis_failed` flag lets downstream code distinguish a genuine
+    "no_entry" judgment from an analysis/LLM failure, so we never broadcast a
+    misleading "매수 보류" message for a stock we couldn't actually analyze.
+    """
     return {
         "portfolio_analysis": "Analysis failed",
         "buy_score": 0,
@@ -419,7 +457,8 @@ def default_scenario() -> Dict[str, Any]:
         "investment_period": "short",
         "rationale": "Analysis failed",
         "sector": "Unknown",
-        "considerations": "Analysis failed"
+        "considerations": "Analysis failed",
+        "analysis_failed": True
     }
 
 
@@ -449,7 +488,7 @@ class USStockTrackingAgent:
         self,
         db_path: str = "stock_tracking_db.sqlite",
         telegram_token: str = None,
-        enable_journal: bool = False
+        enable_journal: bool = None
     ):
         """
         Initialize US Stock Tracking Agent.
@@ -457,7 +496,9 @@ class USStockTrackingAgent:
         Args:
             db_path: SQLite database file path
             telegram_token: Telegram bot token
-            enable_journal: Whether to enable trading journal feature
+            enable_journal: Enable trading journal feature.
+                Priority: parameter > ENABLE_TRADING_JOURNAL env > default(False).
+                (KR 에이전트와 동일 토글 — 기존엔 US가 env 무시하고 False 하드코딩이라 일지 미동작)
         """
         self.max_slots = self.MAX_SLOTS
         self.message_queue = []
@@ -469,7 +510,13 @@ class USStockTrackingAgent:
         self.conn = None
         self.cursor = None
         self.language = "en"  # Default to English for US
-        self.enable_journal = enable_journal
+        # Trading journal feature flag — Priority: parameter > env > default(False).
+        # KR 에이전트와 동일하게 ENABLE_TRADING_JOURNAL env 를 존중한다.
+        if enable_journal is not None:
+            self.enable_journal = enable_journal
+        else:
+            env_value = os.environ.get("ENABLE_TRADING_JOURNAL", "false").lower()
+            self.enable_journal = env_value in ("true", "1", "yes")
         self.account_configs: list[dict[str, Any]] = []
         self.active_account: dict[str, Any] | None = None
 
@@ -483,13 +530,19 @@ class USStockTrackingAgent:
         if self.telegram_token:
             self.telegram_bot = Bot(token=self.telegram_token)
 
-    async def initialize(self, language: str = "ko", sector_names: list = None):
+    async def initialize(self, language: str = "ko", sector_names: list = None,
+                         skip_llm_agent: bool = False):
         """
         Create necessary tables and initialize.
 
         Args:
             language: Language code for agents (default: "ko")
             sector_names: List of valid sector names for trading agent (optional)
+            skip_llm_agent: When True, skip creating the LLM trading-scenario agent.
+                The sell path (sell_stock / send_telegram_message) does NOT use
+                self.trading_agent, so the LLM-free Loop A hard-stop loop can reuse
+                the sell/journal/telegram plumbing without the heavy LLM agent.
+                Default False keeps batch behaviour byte-for-byte unchanged.
         """
         logger.info("Starting US tracking agent initialization")
 
@@ -500,8 +553,9 @@ class USStockTrackingAgent:
         self.conn.row_factory = sqlite3.Row
         self.cursor = self.conn.cursor()
 
-        # Initialize trading scenario agent for US
-        self.trading_agent = create_us_trading_scenario_agent(language=language, sector_names=sector_names)
+        # Initialize trading scenario agent for US (skipped for lightweight consumers).
+        self.trading_agent = None if skip_llm_agent else \
+            create_us_trading_scenario_agent(language=language, sector_names=sector_names)
 
         # Initialize sell decision agent for US
         self.sell_decision_agent = create_us_sell_decision_agent(language=language)
@@ -622,8 +676,16 @@ class USStockTrackingAgent:
         account_key, _ = self._account_scope()
         return get_us_holdings_count(self.cursor, account_key=account_key)
 
-    async def _check_sector_diversity(self, sector: str) -> bool:
-        """Check for over-concentration in same sector."""
+    async def _check_sector_diversity(self, sector: str, is_pyramiding_add: bool = False) -> bool:
+        """Check for over-concentration in same sector.
+
+        Pyramiding adds (#288) target a ticker already held, so the name is
+        already counted toward the sector. Adding to it does not introduce a
+        new name into the sector, so the count-based concentration limit should
+        not block it — only brand-new positions are subject to the limit.
+        """
+        if is_pyramiding_add:
+            return True
         account_key, _ = self._account_scope()
         return check_sector_diversity(
             self.cursor, sector,
@@ -678,7 +740,7 @@ class USStockTrackingAgent:
                         sector_distribution[sector_name] = sector_distribution.get(sector_name, 0) + 1
                         period = scenario_data.get('investment_period', 'medium')
                         investment_periods[period] = investment_periods.get(period, 0) + 1
-                except:
+                except Exception:
                     pass
 
             # Portfolio info string
@@ -691,6 +753,7 @@ class USStockTrackingAgent:
             # Get trading journal context for informed decisions
             journal_context = ""
             score_adjustment_info = ""
+            adjustment, reasons = 0, []
             if ticker:
                 journal_context = self.get_journal_context(
                     ticker=ticker,
@@ -741,21 +804,54 @@ class USStockTrackingAgent:
             {report_content}
             """
 
-            response = await llm.generate_str(
-                message=prompt_message,
-                request_params=RequestParams(
-                    model="gpt-5.5",
-                    maxTokens=30000
-                )
-            )
+            # LLM scenario generation with retry+backoff. Transient API/parse
+            # failures (rate limits, truncated responses) were silently turning
+            # into default_scenario() — i.e. a misleading "Analysis failed" skip.
+            # Retry a couple of times before giving up.
+            ticker_tag = ticker or "?"
+            max_attempts = 3
+            response = None
+            scenario_json = None
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    response = await llm.generate_str(
+                        message=prompt_message,
+                        request_params=RequestParams(
+                            model="gpt-5.5",
+                            maxTokens=30000
+                        )
+                    )
+                    # JSON parsing (consolidated in cores/utils.py)
+                    scenario_json = parse_llm_json(response, context='US trading scenario')
+                    if scenario_json is not None:
+                        break
+                    logger.warning(
+                        f"[{ticker_tag}] US trading scenario parse returned None "
+                        f"(attempt {attempt}/{max_attempts})"
+                    )
+                except Exception as call_err:
+                    log_openai_error(logger, call_err, f"US trading scenario LLM call [{ticker_tag}]")
+                    logger.warning(
+                        f"[{ticker_tag}] US trading scenario LLM call failed "
+                        f"(attempt {attempt}/{max_attempts}): {call_err}"
+                    )
+                if attempt < max_attempts:
+                    await asyncio.sleep(2 * attempt)  # linear backoff: 2s, 4s
 
-            # JSON parsing (consolidated in cores/utils.py)
-            scenario_json = parse_llm_json(response, context='US trading scenario')
             if scenario_json is not None:
+                # Persist the experience-based score adjustment alongside the scenario.
+                # It rides inside the scenario JSON, stored in us_stock_holdings.scenario and
+                # copied to us_trading_history.scenario on sell — giving the weekly influence
+                # report a journal-impact signal for free (#280).
+                if adjustment != 0 or reasons:
+                    scenario_json["score_adjustment"] = {"value": adjustment, "reasons": reasons}
                 logger.info(f"Scenario parsed: {json.dumps(scenario_json, ensure_ascii=False)[:200]}")
                 return scenario_json
 
-            logger.error(f"US trading scenario parse failed. Full response: {response}")
+            logger.error(
+                f"[ANALYSIS_FAILED][{ticker_tag}] US trading scenario unavailable after "
+                f"{max_attempts} attempts. Last response (truncated): {str(response)[:500]}"
+            )
             return default_scenario()
 
         except Exception as e:
@@ -805,6 +901,17 @@ class USStockTrackingAgent:
                 trigger_mode=trigger_mode
             )
 
+            # Analysis/LLM failure sentinel: do NOT emit a misleading "매수 보류"
+            # message or watchlist entry. Log clearly and skip the ticker via the
+            # same path as a hard failure (success=False), unifying both failure modes.
+            if scenario.get("analysis_failed"):
+                logger.error(
+                    f"[ANALYSIS_FAILED][{ticker}] {company_name}: trading scenario unavailable "
+                    f"after retries — skipping (no trade, no skip message, no watchlist)"
+                )
+                return {"success": False, "error": "analysis_failed",
+                        "ticker": ticker, "company_name": company_name}
+
             raw_decision = scenario.get("decision", "no_entry")
             sector = scenario.get("sector", "Unknown")
 
@@ -822,7 +929,7 @@ class USStockTrackingAgent:
             }
 
         except Exception as e:
-            logger.error(f"Error analyzing report: {str(e)}")
+            logger.error(f"[ANALYSIS_FAILED] Error analyzing report ({pdf_report_path}): {str(e)}")
             logger.error(traceback.format_exc())
             return {"success": False, "error": str(e)}
 
@@ -843,14 +950,31 @@ class USStockTrackingAgent:
         ticker = analysis_result.get("ticker")
         company_name = analysis_result.get("company_name")
         if await self._is_ticker_in_holdings(ticker):
-            logger.info(f"{ticker} ({company_name}) already in holdings")
-            return {
-                "success": True,
-                "decision": "holding",
-                "ticker": ticker,
-                "company_name": company_name,
-                "current_price": analysis_result.get("current_price", 0)
-            }
+            # Pyramiding (#288): allow an additional independent entry only when the
+            # strong-bull add-gate passes. Otherwise keep the legacy hard block.
+            scenario = analysis_result.get("scenario", {}) or {}
+            current_price = analysis_result.get("current_price", 0)
+            account_key = self._account_scope()[0]
+            existing = get_us_existing_position_for_ticker(self.cursor, ticker, account_key=account_key)
+            allowed, reason = evaluate_us_pyramid_add_gate(
+                market_condition=scenario.get("market_condition", ""),
+                existing_avg_buy_price=existing.get("avg_buy_price", 0.0),
+                current_price=current_price,
+                existing_row_count=existing.get("row_count", 0),
+            )
+            if not allowed:
+                logger.info(f"{ticker} ({company_name}) already in holdings — add gate blocked: {reason}")
+                return {
+                    "success": True,
+                    "decision": "holding",
+                    "ticker": ticker,
+                    "company_name": company_name,
+                    "current_price": current_price
+                }
+            logger.info(f"{ticker} ({company_name}) pyramiding add gate passed: {reason}")
+            analysis_result["is_add"] = True
+            analysis_result["existing_avg_buy_price"] = existing.get("avg_buy_price", 0.0)
+            analysis_result["existing_row_count"] = existing.get("row_count", 0)
 
         analysis_result["sector_diverse"] = await self._check_sector_diversity(
             analysis_result.get("sector", "Unknown")
@@ -858,7 +982,7 @@ class USStockTrackingAgent:
         return analysis_result
 
     async def buy_stock(self, ticker: str, company_name: str, current_price: float,
-                        scenario: Dict[str, Any], rank_change_msg: str = "") -> bool:
+                        scenario: Dict[str, Any], rank_change_msg: str = "", is_add: bool = False) -> bool:
         """
         Process stock purchase.
 
@@ -868,13 +992,15 @@ class USStockTrackingAgent:
             current_price: Current stock price in USD
             scenario: Trading scenario information
             rank_change_msg: Trading value ranking change info
+            is_add: Pyramiding add (#288) — bypass the already-holding re-check and
+                    insert an independent additional row instead of a first entry.
 
         Returns:
             bool: Purchase success status
         """
         try:
-            # Check if already holding
-            if await self._is_ticker_in_holdings(ticker):
+            # Check if already holding (skipped for a pyramiding add)
+            if not is_add and await self._is_ticker_in_holdings(ticker):
                 logger.warning(f"{ticker} ({company_name}) already in holdings")
                 return False
 
@@ -920,16 +1046,31 @@ class USStockTrackingAgent:
             )
             self.conn.commit()
 
-            # Build buy message (same format as KR template)
+            # Build buy message (same format as KR template).
+            # Pyramiding adds (#288) get a distinct header showing the entry number
+            # and the new aggregate average price.
             target_price = scenario.get('target_price', 0)
             stop_loss = scenario.get('stop_loss', 0)
 
-            message = f"📈 New Buy: {company_name}({ticker})\n" \
-                      f"Buy Price: ${current_price:,.2f}\n" \
-                      f"Target: ${target_price:,.2f}\n" \
-                      f"Stop Loss: ${stop_loss:,.2f}\n" \
-                      f"Period: {scenario.get('investment_period', 'short')}\n" \
-                      f"Sector: {scenario.get('sector', 'Unknown')}\n"
+            if is_add:
+                agg = get_us_existing_position_for_ticker(self.cursor, ticker, account_key=account_key)
+                entry_no = agg.get("row_count", 1)  # this entry is the Nth row
+                new_avg = agg.get("avg_buy_price", current_price)
+                message = f"📈 Add-On Entry (#{entry_no}): {company_name}({ticker})\n" \
+                          f"This Entry: ${current_price:,.2f}\n" \
+                          f"New Avg Price: ${new_avg:,.2f}\n" \
+                          f"⚠️ Portfolio weight increased (1 independent slot consumed)\n" \
+                          f"Target: ${target_price:,.2f}\n" \
+                          f"Stop Loss: ${stop_loss:,.2f}\n" \
+                          f"Period: {scenario.get('investment_period', 'short')}\n" \
+                          f"Sector: {scenario.get('sector', 'Unknown')}\n"
+            else:
+                message = f"📈 New Buy: {company_name}({ticker})\n" \
+                          f"Buy Price: ${current_price:,.2f}\n" \
+                          f"Target: ${target_price:,.2f}\n" \
+                          f"Stop Loss: ${stop_loss:,.2f}\n" \
+                          f"Period: {scenario.get('investment_period', 'short')}\n" \
+                          f"Sector: {scenario.get('sector', 'Unknown')}\n"
 
             # Add trigger win rate
             trigger_win_rate = self._get_trigger_win_rate(trigger_type)
@@ -950,6 +1091,19 @@ class USStockTrackingAgent:
 
             message += f"Rationale: {scenario.get('rationale', 'No information')}\n"
 
+            # Surface journal-grounded reasoning so the feedback loop is transparent (#280).
+            # All fields optional — defends against scenarios without journal_reflection.
+            _jr = scenario.get('journal_reflection') or {}
+            if isinstance(_jr, dict):
+                if _jr.get('recent_exit_caution'):
+                    message += f"⚠️ 최근 매도 주의: {_jr.get('recent_exit_caution')}\n"
+                if _jr.get('applied_lessons'):
+                    message += f"📒 매매일지 반영: {_jr.get('applied_lessons')}\n"
+            _sadj = scenario.get('score_adjustment') or {}
+            if isinstance(_sadj, dict) and _sadj.get('value'):
+                _rsn = ', '.join(_sadj.get('reasons', []) or [])
+                message += f"📊 경험 기반 점수조정: {_sadj.get('value'):+d}점 ({_rsn})\n"
+
             # Trading scenario details (same format as KR version)
             trading_scenarios = scenario.get('trading_scenarios', {})
             if trading_scenarios and isinstance(trading_scenarios, dict):
@@ -966,7 +1120,7 @@ class USStockTrackingAgent:
                     primary_resistance = parse_price_value(key_levels.get('primary_resistance', 0))
                     secondary_resistance = parse_price_value(key_levels.get('secondary_resistance', 0))
                     if primary_resistance or secondary_resistance:
-                        message += f"  📈 Resistance:\n"
+                        message += "  📈 Resistance:\n"
                         if secondary_resistance:
                             message += f"    • 2차: ${secondary_resistance:,.2f}\n"
                         if primary_resistance:
@@ -979,7 +1133,7 @@ class USStockTrackingAgent:
                     primary_support = parse_price_value(key_levels.get('primary_support', 0))
                     secondary_support = parse_price_value(key_levels.get('secondary_support', 0))
                     if primary_support or secondary_support:
-                        message += f"  📉 Support:\n"
+                        message += "  📉 Support:\n"
                         if primary_support:
                             message += f"    • 1차: ${primary_support:,.2f}\n"
                         if secondary_support:
@@ -1184,6 +1338,19 @@ class USStockTrackingAgent:
             if trigger_win_rate:
                 skip_message += f"\n{trigger_win_rate}"
 
+            # Surface journal-grounded reasoning so the feedback loop is transparent (#280).
+            # All fields optional — defends against scenarios without journal_reflection.
+            _jr = scenario.get('journal_reflection') or {}
+            if isinstance(_jr, dict):
+                if _jr.get('recent_exit_caution'):
+                    skip_message += f"\n⚠️ 최근 매도 주의: {_jr.get('recent_exit_caution')}"
+                if _jr.get('applied_lessons'):
+                    skip_message += f"\n📒 매매일지 반영: {_jr.get('applied_lessons')}"
+            _sadj = scenario.get('score_adjustment') or {}
+            if isinstance(_sadj, dict) and _sadj.get('value'):
+                _rsn = ', '.join(_sadj.get('reasons', []) or [])
+                skip_message += f"\n📊 경험 기반 점수조정: {_sadj.get('value'):+d}점 ({_rsn})"
+
             self._msg_types.append("analysis")
             self.message_queue.append(skip_message)
 
@@ -1252,10 +1419,19 @@ class USStockTrackingAgent:
                         highest_price = current_price
                         scenario_data['highest_price'] = highest_price
                         updated_scenario_str = json.dumps(scenario_data, ensure_ascii=False)
-                        self.cursor.execute(
-                            "UPDATE us_stock_holdings SET scenario = ? WHERE ticker = ? AND account_key = ?",
-                            (updated_scenario_str, ticker, self._account_scope()[0])
-                        )
+                        # Pyramiding (#288): scope by row id so only THIS row's
+                        # scenario is updated. Fall back to ticker when id missing.
+                        row_id = stock_data.get('id')
+                        if row_id is not None:
+                            self.cursor.execute(
+                                "UPDATE us_stock_holdings SET scenario = ? WHERE id = ?",
+                                (updated_scenario_str, row_id)
+                            )
+                        else:
+                            self.cursor.execute(
+                                "UPDATE us_stock_holdings SET scenario = ? WHERE ticker = ? AND account_key = ?",
+                                (updated_scenario_str, ticker, self._account_scope()[0])
+                            )
                         self.conn.commit()
                         logger.info(f"{ticker} highest_price updated in scenario: ${highest_price:,.2f}")
             except Exception:
@@ -1309,8 +1485,12 @@ class USStockTrackingAgent:
                 if adj_rows:
                     lines = ["### Portfolio Adjustment History:"]
                     for r in adj_rows:
-                        ot = r[1] or 0; nt = r[2] or 0; os_ = r[3] or 0; ns = r[4] or 0
-                        reason = r[5] or "N/A"; urg = r[6] or "N/A"
+                        ot = r[1] or 0
+                        nt = r[2] or 0
+                        os_ = r[3] or 0
+                        ns = r[4] or 0
+                        reason = r[5] or "N/A"
+                        urg = r[6] or "N/A"
                         lines.append(
                             f"- [{r[0][:16]}] Target: ${ot:,.2f}→${nt:,.2f} / "
                             f"Stop: ${os_:,.2f}→${ns:,.2f} ({urg}) — {reason}"
@@ -1326,8 +1506,20 @@ class USStockTrackingAgent:
             # LLM call
             llm = await self.sell_decision_agent.attach_llm(OpenAIAugmentedLLM)
 
+            # 시스템이 사이클당 1회 계산한 LIVE 시장 레짐(S&P500/VIX 기반, OpenAI 무관).
+            # 매수시점 동결값(scenario.market_condition)이 아닌 '현재' 레짐을 권위값으로 주입.
+            live_regime_summary = getattr(self, "_live_regime_summary", None)
+            live_regime_block = (
+                live_regime_summary
+                if live_regime_summary
+                else "unavailable — verify via yahoo_finance (^GSPC 20MA, ^VIX)"
+            )
+
             prompt_message = f"""
 Please make a sell/hold decision for the following US stock holding.
+
+### Current Market Regime (LIVE, system-computed — authoritative):
+{live_regime_block}
 
 ### Stock Information:
 - Stock: {company_name} ({ticker})
@@ -1352,6 +1544,7 @@ Please make a sell/hold decision for the following US stock holding.
 
 ### Task:
 Use yahoo_finance and sqlite tools to check latest data, then decide whether to sell or continue holding.
+**Market regime**: Treat the "Current Market Regime (LIVE)" above as the authoritative market environment for step-0 분석 (강세장/약세장 판단). It is system-computed from S&P500/VIX this cycle; prefer it over the stored buy-time scenario. Only if it shows "unavailable", fall back to fetching ^GSPC/^VIX via yahoo_finance yourself.
 **Important**: If stop loss/target price adjustment is needed, return it via portfolio_adjustment JSON only. Do NOT directly UPDATE the DB.
 """
 
@@ -1400,7 +1593,8 @@ Use yahoo_finance and sqlite tools to check latest data, then decide whether to 
             # Process portfolio_adjustment when holding (not selling)
             if not should_sell and portfolio_adjustment.get("needed", False):
                 await self._process_portfolio_adjustment(
-                    ticker, company_name, portfolio_adjustment, analysis_summary, current_price
+                    ticker, company_name, portfolio_adjustment, analysis_summary, current_price,
+                    row_id=stock_data.get('id')
                 )
 
             return should_sell, sell_reason
@@ -1409,8 +1603,46 @@ Use yahoo_finance and sqlite tools to check latest data, then decide whether to 
             logger.error(f"{ticker} AI sell analysis error: {e}, falling back to rule-based decision")
             return await self._fallback_sell_decision(stock_data)
 
+    def _get_live_regime_safe(self) -> Optional[str]:
+        """매도 사이클의 '현재' 시장 레짐을 yfinance(S&P500/VIX) 기반으로 1회 계산.
+        OpenAI 와 무관하므로 quota 사고 중에도 동작. 실패 시 None → stale 폴백.
+
+        부수효과: self._live_regime_summary 에 AI 매도 프롬프트 주입용 사람-읽기 요약을
+        저장한다(S&P500 vs 20MA, 4주 변동, VIX). 실패 시 None.
+        """
+        self._live_regime_summary = None
+        try:
+            from cores.data_prefetch import prefetch_us_macro_intelligence_data
+            data = prefetch_us_macro_intelligence_data() or {}
+            cr = data.get("computed_regime") or {}
+            regime = cr.get("market_regime")
+            if regime:
+                logger.info(f"[sell] live US market regime: {regime}")
+                s = cr.get("index_summary") or {}
+                conf = cr.get("regime_confidence")
+                parts = [regime]
+                if s.get("sp500_current") is not None and s.get("sp500_20d_ma") is not None:
+                    parts.append(
+                        f"S&P500 {s['sp500_current']} vs 20MA {s['sp500_20d_ma']} "
+                        f"({s.get('sp500_vs_20d_ma','?')})"
+                    )
+                if s.get("sp500_4w_change_pct") is not None:
+                    parts.append(f"4w {s['sp500_4w_change_pct']}%")
+                if s.get("vix_current") is not None:
+                    parts.append(f"VIX {s['vix_current']} ({s.get('vix_level','?')})")
+                if conf is not None:
+                    parts.append(f"confidence {conf}")
+                self._live_regime_summary = " | ".join(str(p) for p in parts)
+            return regime or None
+        except Exception as e:
+            logger.warning(f"[sell] live regime fetch failed, using stale market_condition: {e}")
+            return None
+
     async def _fallback_sell_decision(self, stock_data: Dict[str, Any]) -> Tuple[bool, str]:
         """Rule-based sell decision (fallback when AI unavailable).
+
+        1차: O'Neil 추세추종 룰(cores.oneil_fallback) — 승자 보유/손실 차단.
+        2차(안전망): 모듈 import 실패 등 예외 시에만 기존 레거시 룰.
 
         Args:
             stock_data: Stock information
@@ -1418,6 +1650,21 @@ Use yahoo_finance and sqlite tools to check latest data, then decide whether to 
         Returns:
             Tuple[bool, str]: Whether to sell, sell reason
         """
+        # ── O'Neil 룰베이스 (live regime 주입) ───────────────────
+        if _ONEIL_FALLBACK_AVAILABLE:
+            try:
+                live_regime = getattr(self, "_live_regime_cache", None)
+                inp = _oneil_from(stock_data, live_regime=live_regime)
+                should_sell, reason = _oneil_eval(inp)
+                logger.info(
+                    f"{stock_data.get('ticker','')} O'Neil rule-based sell: "
+                    f"{'Sell' if should_sell else 'Hold'} | {reason}"
+                )
+                return should_sell, reason
+            except Exception as e:
+                logger.error(f"O'Neil fallback error, using legacy rules: {e}")
+
+        # ── 레거시 안전망 (O'Neil 모듈 불가/예외 시에만) ─────────
         try:
             ticker = stock_data.get('ticker', '')
             buy_price = stock_data.get('buy_price', 0)
@@ -1441,7 +1688,7 @@ Use yahoo_finance and sqlite tools to check latest data, then decide whether to 
                 if isinstance(scenario_str, str):
                     scenario_data = json.loads(scenario_str)
                     investment_period = scenario_data.get('investment_period', 'medium')
-            except:
+            except Exception:
                 pass
 
             # Check stop-loss condition (same format as KR template)
@@ -1495,9 +1742,15 @@ Use yahoo_finance and sqlite tools to check latest data, then decide whether to 
         company_name: str,
         portfolio_adjustment: Dict[str, Any],
         analysis_summary: Dict[str, Any],
-        current_price: float = 0
+        current_price: float = 0,
+        row_id: int = None
     ):
-        """Process DB updates and Telegram notifications based on portfolio_adjustment"""
+        """Process DB updates and Telegram notifications based on portfolio_adjustment
+
+        row_id: pyramiding (#288) — when provided, all UPDATEs/SELECT target only
+                this specific holding row (multi-row correctness). Falls back to
+                ticker-scoped queries when None.
+        """
         try:
             if not portfolio_adjustment.get("needed", False):
                 return
@@ -1508,10 +1761,16 @@ Use yahoo_finance and sqlite tools to check latest data, then decide whether to 
                 return
 
             # Verify holding exists in DB
-            self.cursor.execute(
-                "SELECT target_price, stop_loss FROM us_stock_holdings WHERE ticker = ? AND account_key = ?",
-                (ticker, self._account_scope()[0])
-            )
+            if row_id is not None:
+                self.cursor.execute(
+                    "SELECT target_price, stop_loss FROM us_stock_holdings WHERE id = ?",
+                    (row_id,)
+                )
+            else:
+                self.cursor.execute(
+                    "SELECT target_price, stop_loss FROM us_stock_holdings WHERE ticker = ? AND account_key = ?",
+                    (ticker, self._account_scope()[0])
+                )
             row = self.cursor.fetchone()
             if row is None:
                 logger.warning(f"{ticker} us_stock_holdings SELECT returned None - skipping adjustment")
@@ -1531,10 +1790,16 @@ Use yahoo_finance and sqlite tools to check latest data, then decide whether to 
                 except (ValueError, TypeError):
                     target_price_num = 0
                 if target_price_num > 0:
-                    self.cursor.execute(
-                        "UPDATE us_stock_holdings SET target_price = ? WHERE ticker = ? AND account_key = ?",
-                        (target_price_num, ticker, self._account_scope()[0])
-                    )
+                    if row_id is not None:
+                        self.cursor.execute(
+                            "UPDATE us_stock_holdings SET target_price = ? WHERE id = ?",
+                            (target_price_num, row_id)
+                        )
+                    else:
+                        self.cursor.execute(
+                            "UPDATE us_stock_holdings SET target_price = ? WHERE ticker = ? AND account_key = ?",
+                            (target_price_num, ticker, self._account_scope()[0])
+                        )
                     self.conn.commit()
                     db_updated = True
                     if target_price_num > old_target_price:
@@ -1568,10 +1833,16 @@ Use yahoo_finance and sqlite tools to check latest data, then decide whether to 
                             f"${stop_loss_num:,.2f} < ${old_stop_loss:,.2f} — ignoring."
                         )
                     else:
-                        self.cursor.execute(
-                            "UPDATE us_stock_holdings SET stop_loss = ? WHERE ticker = ? AND account_key = ?",
-                            (stop_loss_num, ticker, self._account_scope()[0])
-                        )
+                        if row_id is not None:
+                            self.cursor.execute(
+                                "UPDATE us_stock_holdings SET stop_loss = ? WHERE id = ?",
+                                (stop_loss_num, row_id)
+                            )
+                        else:
+                            self.cursor.execute(
+                                "UPDATE us_stock_holdings SET stop_loss = ? WHERE ticker = ? AND account_key = ?",
+                                (stop_loss_num, ticker, self._account_scope()[0])
+                            )
                         self.conn.commit()
                         db_updated = True
                         if stop_loss_num > old_stop_loss:
@@ -1747,13 +2018,19 @@ Use yahoo_finance and sqlite tools to check latest data, then decide whether to 
             logger.error(f"{ticker} US holding decision delete failed: {str(e)}")
             return False
 
-    async def sell_stock(self, stock_data: Dict[str, Any], sell_reason: str) -> bool:
+    async def sell_stock(self, stock_data: Dict[str, Any], sell_reason: str,
+                         exit_kind: Optional[str] = None) -> bool:
         """
         Process stock sale.
 
         Args:
             stock_data: Stock information to sell
             sell_reason: Sell reason
+            exit_kind: Optional explicit exit classification (stop | trend_exit |
+                target | ai). Loops pass it deterministically (loop_a=stop,
+                loop_b=trend_exit); when None it is inferred from sell_reason. Stored
+                in us_trading_history so the re-entry cooldown treats a stop-out at a
+                marginal profit as churn-risk.
 
         Returns:
             bool: Sell success status
@@ -1771,6 +2048,31 @@ Use yahoo_finance and sqlite tools to check latest data, then decide whether to 
             account_key = stock_data.get("account_key") or self._account_scope()[0]
             account_name = stock_data.get("account_name") or self._account_scope()[1]
 
+            # ── Cross-cycle sell guard (single source of truth) ──────────────
+            # EVERY sell path routes its real order + signal publish through
+            # sell_stock and gates on this bool return: the batch update_holdings,
+            # loop_a_hardstop, and loop_b_trend_exit (KR + US). A concurrent cycle
+            # may have already closed this position seconds/minutes ago, so refresh
+            # the connection snapshot (commit ends any stale WAL read-txn so other
+            # processes' commits are visible) and abort if the row is gone — no
+            # trading_history row, no delete, no journal, no queued message — so the
+            # caller publishes NO duplicate/ghost SELL and P&L is not double-counted.
+            # Incident 2026-07-01 (MU): loop_a stop-sold 23:50 (+published SELL),
+            # the batch re-hit the same stop off a stale snapshot and re-published a
+            # 2nd SELL 23:55. sell_stock is the chokepoint that closes this for all
+            # paths in both markets. (update_holdings also has an earlier Layer 2
+            # short-circuit; this is the authoritative gate that also covers loops.)
+            self.conn.commit()
+            if get_us_existing_position_for_ticker(
+                self.cursor, ticker, account_key=account_key
+            ).get("row_count", 0) == 0:
+                logger.warning(
+                    f"[SELL-GUARD][US] {ticker} ({company_name}) already closed by "
+                    f"another cycle — sell_stock aborting (no duplicate record/signal)"
+                )
+                return False
+            # ─────────────────────────────────────────────────────────────────
+
             # Calculate profit rate
             profit_rate = ((current_price - buy_price) / buy_price) * 100 if buy_price > 0 else 0
 
@@ -1779,34 +2081,55 @@ Use yahoo_finance and sqlite tools to check latest data, then decide whether to 
             holding_days = (datetime.now() - buy_datetime).days
             now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+            # Classify the exit (stop/trend_exit/target/ai) for the churn guard.
+            try:
+                from reentry_cooldown import classify_exit_kind
+                _exit_kind = classify_exit_kind(sell_reason, exit_kind)
+            except Exception:
+                _exit_kind = exit_kind  # fail-open: store caller hint or None
+
             # Add to trading history
             self.cursor.execute(
                 """
                 INSERT INTO us_trading_history
                 (account_key, account_name, ticker, company_name, buy_price, buy_date, sell_price, sell_date,
-                 profit_rate, holding_days, scenario, trigger_type, trigger_mode, sector)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 profit_rate, holding_days, scenario, trigger_type, trigger_mode, sector, exit_kind)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     account_key, account_name, ticker, company_name, buy_price, buy_date,
                     current_price, now, profit_rate, holding_days,
-                    scenario_json, trigger_type, trigger_mode, sector
+                    scenario_json, trigger_type, trigger_mode, sector, _exit_kind
                 )
             )
 
-            # Remove from holdings
-            self.cursor.execute(
-                "DELETE FROM us_stock_holdings WHERE ticker = ? AND account_key = ?",
-                (ticker, account_key)
-            )
-            # Cleanup portfolio adjustment history (lifecycle management)
-            try:
+            # Remove from holdings.
+            # Pyramiding (#288): when the row carries an id AND the ticker has more
+            # than one row for this account, delete ONLY that row (preserving the
+            # remaining independent entries). Single-row tickers keep the legacy
+            # ticker-scoped delete + adjustment-log cleanup (zero behavior change).
+            row_id = stock_data.get('id')
+            existing = get_us_existing_position_for_ticker(self.cursor, ticker, account_key=account_key)
+            is_partial = row_id is not None and existing.get("row_count", 0) > 1
+            if is_partial:
                 self.cursor.execute(
-                    "DELETE FROM us_portfolio_adjustment_log WHERE ticker = ? AND account_key = ?",
+                    "DELETE FROM us_stock_holdings WHERE id = ?",
+                    (row_id,)
+                )
+            else:
+                self.cursor.execute(
+                    "DELETE FROM us_stock_holdings WHERE ticker = ? AND account_key = ?",
                     (ticker, account_key)
                 )
-            except Exception as e:
-                logger.debug(f"{ticker} Cleanup adjustment log skipped: {e}")
+                # Cleanup portfolio adjustment history only when the ticker is fully
+                # exited (no remaining rows).
+                try:
+                    self.cursor.execute(
+                        "DELETE FROM us_portfolio_adjustment_log WHERE ticker = ? AND account_key = ?",
+                        (ticker, account_key)
+                    )
+                except Exception as e:
+                    logger.debug(f"{ticker} Cleanup adjustment log skipped: {e}")
             self.conn.commit()
 
             # Build sell message (same format as KR template)
@@ -1859,9 +2182,15 @@ Use yahoo_finance and sqlite tools to check latest data, then decide whether to 
         try:
             logger.info("Starting US holdings update")
 
+            # 매도 판단에 쓸 '현재' 시장 레짐을 사이클당 1회 계산(OpenAI 무관).
+            # _fallback_sell_decision 이 self._live_regime_cache 로 참조한다.
+            self._live_regime_cache = self._get_live_regime_safe()
+
             # Query holdings list
+            # id included for pyramiding (#288): enables per-row delete and
+            # fractional-sell quantity computation for multi-row tickers.
             self.cursor.execute(
-                """SELECT ticker, company_name, buy_price, buy_date, current_price,
+                """SELECT id, ticker, company_name, buy_price, buy_date, current_price,
                    scenario, target_price, stop_loss, last_updated,
                    trigger_type, trigger_mode, sector, account_key, account_name
                    FROM us_stock_holdings
@@ -1876,9 +2205,25 @@ Use yahoo_finance and sqlite tools to check latest data, then decide whether to 
 
             sold_stocks = []
 
+            # Pyramiding (#288) FIX 2 — in-pass over-sell guard (mirror of KR):
+            # snapshot the ticker's total broker qty ONCE per pass and distribute
+            # from (snapshot - already_ordered), so unfilled limit/reserved orders
+            # cannot cause an over-sell on later iterations of the same ticker.
+            pass_total_qty: Dict[str, int] = {}   # ticker -> snapshot total qty
+            pass_sold_qty: Dict[str, int] = {}    # ticker -> cumulative ordered qty
+            # FIX 1 — tickers already FULL-exited this pass (all rows sold at once
+            # because the order had to be queued). Their remaining DB rows were
+            # already removed, so skip them when the loop reaches them.
+            fully_exited_tickers: set = set()
+
             for stock in holdings:
                 ticker = stock.get('ticker')
                 company_name = stock.get('company_name')
+
+                # FIX 1: skip rows whose ticker was already fully exited this pass.
+                if ticker in fully_exited_tickers:
+                    logger.info(f"{ticker} already fully exited this pass — skipping remaining row")
+                    continue
 
                 # Query current stock price
                 current_price = await self._get_current_stock_price(ticker)
@@ -1895,10 +2240,92 @@ Use yahoo_finance and sqlite tools to check latest data, then decide whether to 
                 should_sell, sell_reason = await self._analyze_sell_decision(stock)
 
                 if should_sell:
+                    acct_key = stock.get("account_key")
+
+                    # ── Layer 2: fresh holding re-check (cross-cycle stale-snapshot guard) ──
+                    # update_holdings iterates a holdings snapshot taken at pipeline
+                    # start (~40 min earlier). A concurrent intraday loop
+                    # (loop_a_hardstop / loop_b_trend_exit, both */10 on cron) may have
+                    # already closed this position minutes ago. Re-read the live DB row
+                    # right before acting; if it is gone, abort THIS ticker entirely —
+                    # no real order, NO signal publish, no journal — so subscribers never
+                    # receive a duplicate/ghost SELL.
+                    # Incident 2026-07-01: loop_a stop-sold MU 23:50 (+published SELL),
+                    # then the batch re-hit the same stop off its stale snapshot 23:54,
+                    # its real sell no-op'd ("not found in portfolio") yet it still
+                    # published a 2nd SELL 23:55. This guard closes that gap at the source.
+                    self.conn.commit()  # end any read snapshot so other-process commits are visible (WAL)
+                    if get_us_existing_position_for_ticker(
+                        self.cursor, ticker, account_key=acct_key
+                    ).get("row_count", 0) == 0:
+                        logger.warning(
+                            f"[LAYER2][US] {ticker} already closed by another cycle "
+                            f"(stale snapshot) — skipping sell + signal publish"
+                        )
+                        continue
+                    # ── end Layer 2 guard ──
+
+                    # Pyramiding (#288): compute remaining row count N for this
+                    # (ticker, account) BEFORE any DB row is deleted by sell_stock.
+                    remaining_rows = get_us_existing_position_for_ticker(
+                        self.cursor, ticker, account_key=acct_key
+                    ).get("row_count", 1)
+
+                    # FIX 1: decide the execution plan. A fractional (N>1) order
+                    # that would be QUEUED for the pending-order batch must NOT be
+                    # sent as a partial (the queue drops the quantity and later
+                    # full-liquidates the broker position). In that case do a FULL
+                    # position exit instead: sell the whole holding once and delete
+                    # ALL rows for the ticker so DB and broker stay consistent.
+                    will_queue = False
+                    if remaining_rows > 1 and current_price > 0:
+                        try:
+                            try:
+                                from trading.us_stock_trading import AsyncUSTradingContext
+                            except ImportError:
+                                from prism_us.trading.us_stock_trading import AsyncUSTradingContext
+                            async with AsyncUSTradingContext(account_name=stock.get("account_name")) as _probe:
+                                # Order gets queued when market is closed AND the
+                                # reserved-order window is unavailable (pre-10:00 KST).
+                                will_queue = (not _probe.is_market_open()) and (not _probe.is_reserved_order_available())
+                        except Exception as probe_err:
+                            logger.warning(f"{ticker} could not probe order window ({probe_err}); assuming will_queue=True (safe full-exit)")
+                            will_queue = True
+
+                    plan = decide_us_sell_plan(remaining_rows, will_queue)
+                    logger.info(f"{ticker} sell plan: {plan} (remaining_rows={remaining_rows}, will_queue={will_queue})")
+
                     # Delete from holding_decisions when selling
                     await self._delete_holding_decision(ticker)
 
-                    sell_success = await self.sell_stock(stock, sell_reason)
+                    if plan == "full_exit":
+                        # Record P&L for EVERY remaining row at current price and
+                        # delete them all (sell_stock deletes one row per call;
+                        # the final call deletes the last row by ticker scope).
+                        self.cursor.execute(
+                            """SELECT id, ticker, company_name, buy_price, buy_date, current_price,
+                               scenario, target_price, stop_loss, last_updated,
+                               trigger_type, trigger_mode, sector, account_key, account_name
+                               FROM us_stock_holdings
+                               WHERE ticker = ? AND account_key = ?""",
+                            (ticker, acct_key),
+                        )
+                        sibling_rows = [dict(r) for r in self.cursor.fetchall()]
+                        sell_success = True
+                        for sib in sibling_rows:
+                            sib['current_price'] = current_price
+                            ok = await self.sell_stock(sib, sell_reason)
+                            sell_success = sell_success and ok
+                        # Mark immediately (independent of KIS result) so the
+                        # already-deleted sibling rows still in the in-memory
+                        # `holdings` snapshot are skipped later this pass.
+                        fully_exited_tickers.add(ticker)
+                        logger.info(
+                            f"{ticker} FULL-EXIT: closed {len(sibling_rows)} pyramid rows "
+                            f"(queued order cannot carry a partial quantity)"
+                        )
+                    else:
+                        sell_success = await self.sell_stock(stock, sell_reason)
 
                     if sell_success:
                         # Execute actual trading
@@ -1912,9 +2339,35 @@ Use yahoo_finance and sqlite tools to check latest data, then decide whether to 
                                 except ImportError:
                                     from prism_us.trading.us_stock_trading import AsyncUSTradingContext
                                 async with AsyncUSTradingContext(account_name=stock.get("account_name")) as trading:
+                                    # Determine sell quantity.
+                                    # FIX 1: full_exit -> quantity=None (sell whole position).
+                                    # FIX 2: fractional -> distribute from a per-pass snapshot
+                                    # (snapshot - already_ordered) so unfilled orders cannot over-sell.
+                                    sell_quantity = None
+                                    # The FINAL row of a ticker already split THIS pass
+                                    # (plan flips to "single_full" at remaining_rows==1) must also
+                                    # sell from the snapshot remainder, NOT re-query the broker —
+                                    # otherwise unfilled earlier limit orders make get_holding_quantity
+                                    # return the full position and the last row over-sells (#288 FIX 2).
+                                    if plan == "fractional" or (ticker in pass_total_qty and plan == "single_full"):
+                                        if ticker not in pass_total_qty:
+                                            pass_total_qty[ticker] = await asyncio.to_thread(
+                                                trading.get_holding_quantity, ticker
+                                            )
+                                            pass_sold_qty[ticker] = 0
+                                        available = pass_total_qty[ticker] - pass_sold_qty[ticker]
+                                        sell_quantity = compute_us_fractional_sell_quantity(available, remaining_rows)
+                                        pass_sold_qty[ticker] += sell_quantity
+                                        logger.info(
+                                            f"{ticker} pyramiding fractional sell: {sell_quantity} shares "
+                                            f"(available {available} of snapshot {pass_total_qty[ticker]}, "
+                                            f"remaining rows={remaining_rows})"
+                                        )
+                                    # plan == "full_exit" -> sell_quantity stays None (full position);
+                                    # the ticker was already added to fully_exited_tickers above.
                                     # Pass limit_price for reserved orders (required for US market)
                                     # If limit_price is 0, trading module will use MOO (Market On Open)
-                                    trade_result = await trading.async_sell_stock(ticker=ticker, limit_price=current_price)
+                                    trade_result = await trading.async_sell_stock(ticker=ticker, limit_price=current_price, quantity=sell_quantity)
 
                                 if trade_result['success']:
                                     logger.info(f"Actual sell successful: {trade_result['message']}")
@@ -1961,21 +2414,27 @@ Use yahoo_finance and sqlite tools to check latest data, then decide whether to 
                         except Exception as signal_err:
                             logger.warning(f"GCP sell signal publish failed (non-critical): {signal_err}")
 
-                        sold_stocks.append({
-                            "ticker": ticker,
-                            "company_name": company_name,
-                            "buy_price": stock.get('buy_price', 0),
-                            "sell_price": current_price,
-                            "profit_rate": ((current_price - stock.get('buy_price', 0)) / stock.get('buy_price', 0) * 100) if stock.get('buy_price', 0) > 0 else 0,
-                            "reason": sell_reason,
-                            "account_name": stock.get("account_name"),
-                            "account_label": self._safe_account_log_label(
-                                {
-                                    "name": stock.get("account_name"),
-                                    "account_key": stock.get("account_key"),
-                                }
-                            ),
-                        })
+                        # Report sold rows. For a full_exit, every closed pyramid
+                        # row is reported (so the sell count matches reality);
+                        # otherwise just the single row that triggered the sell.
+                        _exited_rows = sibling_rows if plan == "full_exit" else [stock]
+                        for _row in _exited_rows:
+                            _bp = _row.get('buy_price', 0)
+                            sold_stocks.append({
+                                "ticker": ticker,
+                                "company_name": _row.get('company_name', company_name),
+                                "buy_price": _bp,
+                                "sell_price": current_price,
+                                "profit_rate": ((current_price - _bp) / _bp * 100) if _bp > 0 else 0,
+                                "reason": sell_reason,
+                                "account_name": _row.get("account_name"),
+                                "account_label": self._safe_account_log_label(
+                                    {
+                                        "name": _row.get("account_name"),
+                                        "account_key": _row.get("account_key"),
+                                    }
+                                ),
+                            })
                 else:
                     # Save holding decision when not selling
                     await self._save_holding_decision(ticker, current_price, should_sell, sell_reason, stock)
@@ -2056,7 +2515,7 @@ Use yahoo_finance and sqlite tools to check latest data, then decide whether to 
             sector_counts = {}
 
             if holdings and len(holdings) > 0:
-                message += f"🔸 Holdings List:\n"
+                message += "🔸 Holdings List:\n"
                 for stock in holdings:
                     ticker = stock.get('ticker', '')
                     company_name = stock.get('company_name', '')
@@ -2073,7 +2532,7 @@ Use yahoo_finance and sqlite tools to check latest data, then decide whether to 
                         if isinstance(scenario_str, str):
                             scenario_data = json.loads(scenario_str)
                             sector = scenario_data.get('sector', '알 수 없음')
-                    except:
+                    except Exception:
                         sector = stock.get('sector', '알 수 없음')
 
                     # Update sector count
@@ -2091,7 +2550,7 @@ Use yahoo_finance and sqlite tools to check latest data, then decide whether to 
                     message += f"  수익률: {arrow} {profit_rate:.2f}% / 보유기간: {days_passed}일\n\n"
 
                 # Add sector distribution
-                message += f"🔸 Sector Distribution:\n"
+                message += "🔸 Sector Distribution:\n"
                 for sector, count in sector_counts.items():
                     percentage = (count / len(holdings)) * 100
                     message += f"- {sector}: {count}개 ({percentage:.1f}%)\n"
@@ -2100,7 +2559,7 @@ Use yahoo_finance and sqlite tools to check latest data, then decide whether to 
                 message += "No holdings.\n\n"
 
             # 3. Trading history statistics
-            message += f"🔸 매매 이력 통계\n"
+            message += "🔸 매매 이력 통계\n"
             message += f"- 총 거래 건수: {total_trades}건\n"
             message += f"- 수익 거래: {successful_trades}건\n"
             message += f"- 손실 거래: {total_trades - successful_trades}건\n"
@@ -2108,7 +2567,7 @@ Use yahoo_finance and sqlite tools to check latest data, then decide whether to 
             if total_trades > 0:
                 message += f"- 승률: {(successful_trades / total_trades * 100):.2f}%\n"
             else:
-                message += f"- 승률: 0.00%\n"
+                message += "- 승률: 0.00%\n"
 
             message += f"- 누적 수익률: {total_profit:.2f}%\n\n"
 
@@ -2152,7 +2611,11 @@ Use yahoo_finance and sqlite tools to check latest data, then decide whether to 
             for pdf_report_path in pdf_report_paths:
                 analysis_result = await self._analyze_report_core(pdf_report_path)
                 if not analysis_result.get("success", False):
-                    logger.error(f"Report analysis failed: {pdf_report_path}")
+                    logger.error(
+                        f"[ANALYSIS_FAILED] Report analysis skipped "
+                        f"({analysis_result.get('ticker', '?')}/{analysis_result.get('company_name', '?')}): "
+                        f"{analysis_result.get('error')} — {pdf_report_path}"
+                    )
                     continue
                 analysis_states.append(
                     {
@@ -2186,9 +2649,24 @@ Use yahoo_finance and sqlite tools to check latest data, then decide whether to 
                     sector = analysis_result.get("sector", "Unknown")
                     rank_change_msg = analysis_result.get("rank_change_msg", "")
 
+                    # Pyramiding (#288): allow an additional independent entry for a
+                    # held ticker only when the strong-bull add-gate passes. Otherwise
+                    # keep the legacy skip. Computed per active account.
+                    is_add = False
                     if await self._is_ticker_in_holdings(ticker):
-                        logger.info(f"Skipping stock in holdings: {ticker}")
-                        continue
+                        acct_key = self._account_scope()[0]
+                        existing = get_us_existing_position_for_ticker(self.cursor, ticker, account_key=acct_key)
+                        allowed, gate_reason = evaluate_us_pyramid_add_gate(
+                            market_condition=scenario.get("market_condition", ""),
+                            existing_avg_buy_price=existing.get("avg_buy_price", 0.0),
+                            current_price=current_price,
+                            existing_row_count=existing.get("row_count", 0),
+                        )
+                        if not allowed:
+                            logger.info(f"Skipping stock in holdings: {ticker} — add gate blocked: {gate_reason}")
+                            continue
+                        logger.info(f"{ticker} pyramiding add gate passed: {gate_reason}")
+                        is_add = True
 
                     current_slots = await self._get_current_slots_count()
                     if current_slots >= self.max_slots:
@@ -2201,7 +2679,7 @@ Use yahoo_finance and sqlite tools to check latest data, then decide whether to 
                     # Evaluate sector / score / decision independently so the displayed
                     # rejection reason matches the rationale in the same message,
                     # rather than short-circuiting on whichever cause the code checked first.
-                    sector_diverse = await self._check_sector_diversity(sector)
+                    sector_diverse = await self._check_sector_diversity(sector, is_pyramiding_add=is_add)
 
                     buy_score = scenario.get("buy_score", 0)
                     min_score = scenario.get("min_score", 0)
@@ -2237,8 +2715,31 @@ Use yahoo_finance and sqlite tools to check latest data, then decide whether to 
                     if rationale:
                         logger.info(f"Scenario rationale ({company_name}/{ticker}): {rationale[:300]}")
 
-                    if normalized_decision == "entry" and adjusted_score >= min_score and sector_diverse:
-                        buy_success = await self.buy_stock(ticker, company_name, current_price, scenario, rank_change_msg)
+                    # Re-entry cooldown gate (SHADOW logs only; LIVE vetoes a churn
+                    # re-entry — longer cooldown after a loss). Fresh entries only;
+                    # pyramiding adds (is_add) are exempt.
+                    _cd_block = False
+                    if normalized_decision == "entry" and not is_add:
+                        try:
+                            from reentry_cooldown import reentry_block, COOLDOWN_LIVE, COOLDOWN_RISK_EXIT_LIVE
+                            _cd = reentry_block("US", ticker)
+                        except Exception:
+                            _cd, COOLDOWN_LIVE, COOLDOWN_RISK_EXIT_LIVE = None, False, False
+                        if _cd:
+                            # A stop/trend-exit block that is NOT also a loss is the new
+                            # exit-kind branch -> SHADOW unless COOLDOWN_RISK_EXIT_LIVE.
+                            _risk_only = bool(_cd.get("risk_exit")) and not _cd.get("after_loss")
+                            _enforce = COOLDOWN_LIVE and (COOLDOWN_RISK_EXIT_LIVE or not _risk_only)
+                            logger.warning(
+                                "[REENTRY_COOLDOWN][%s] %s ticker=%s last_sell=%s ret=%.1f%% gap=%.1fh<%sh after_loss=%s exit_kind=%s risk_only=%s",
+                                "LIVE" if _enforce else "SHADOW", _cd["action"], ticker,
+                                _cd["last_sell"], _cd["last_ret"], _cd["gap_hours"],
+                                _cd["window_hours"], _cd["after_loss"], _cd.get("exit_kind"), _risk_only)
+                            _cd_block = _enforce
+
+                    if normalized_decision == "entry" and adjusted_score >= min_score and sector_diverse and not _cd_block:
+                        # is_add => pyramiding additional independent row (#288)
+                        buy_success = await self.buy_stock(ticker, company_name, current_price, scenario, rank_change_msg, is_add=is_add)
 
                         if buy_success:
                             trade_result = {'success': False, 'message': 'Trading not executed'}
@@ -2420,10 +2921,20 @@ Use yahoo_finance and sqlite tools to check latest data, then decide whether to 
                 self._msg_types = []
                 return False
 
-            # Generate summary report
-            summary = await self.generate_report_summary()
-            self._msg_types.append("portfolio")
-            self.message_queue.append(summary)
+            # Generate summary report — de-duplicated so near-simultaneous run-ends
+            # (US batch + intraday loops A/B) don't emit 2-3 identical portfolio
+            # summaries. Other queued messages (sell notices) are unaffected.
+            try:
+                from portfolio_broadcast import should_send_portfolio
+                _emit_portfolio = should_send_portfolio("US")
+            except Exception:
+                _emit_portfolio = True  # fail-open
+            if _emit_portfolio:
+                summary = await self.generate_report_summary()
+                self._msg_types.append("portfolio")
+                self.message_queue.append(summary)
+            else:
+                logger.info("[portfolio-dedup] US portfolio summary skipped (sent within debounce window)")
 
             # Translate messages if English is requested
             if language == "en":
@@ -2434,7 +2945,7 @@ Use yahoo_finance and sqlite tools to check latest data, then decide whether to 
                     translated_queue = []
                     for idx, message in enumerate(self.message_queue, 1):
                         logger.info(f"Translating US message {idx}/{len(self.message_queue)}")
-                        translated = await translate_telegram_message(message, model="gpt-5-nano")
+                        translated = await translate_telegram_message(message, model="gpt-5.4-nano")
                         translated_queue.append(translated)
                     self.message_queue = translated_queue
                     logger.info("All US messages translated successfully")
@@ -2547,7 +3058,7 @@ Use yahoo_finance and sqlite tools to check latest data, then decide whether to 
                             logger.info(f"Translating US tracking message to {lang}")
                             translated_message = await translate_telegram_message(
                                 message,
-                                model="gpt-5-nano",
+                                model="gpt-5.4-nano",
                                 from_lang="ko",
                                 to_lang=lang
                             )
@@ -2824,7 +3335,7 @@ Use yahoo_finance and sqlite tools to check latest data, then decide whether to 
             if hasattr(self, 'conn') and self.conn:
                 try:
                     self.conn.close()
-                except:
+                except Exception:
                     pass
 
             return False

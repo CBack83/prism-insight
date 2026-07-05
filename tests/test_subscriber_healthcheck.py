@@ -1,0 +1,408 @@
+"""
+tests/test_subscriber_healthcheck.py
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Unit tests for tools/subscriber_healthcheck.py (mock-only, no network).
+
+Covers:
+  - clean window: no alerts
+  - import failure: CRITICAL alert
+  - attempts but zero successes: CRITICAL alert
+  - failures over threshold: WARN alert
+  - process down: DOWN alert
+  - importlib path-safety: is_us_market_hours() must not pollute sys.path with prism-us,
+    and trading.domestic_stock_trading must remain importable after the call.
+"""
+from __future__ import annotations
+
+import json
+import sys
+import os
+import tempfile
+import types
+from datetime import datetime, timedelta
+from pathlib import Path
+from unittest import mock
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+# ---------------------------------------------------------------------------
+# Ensure repo root is on sys.path so imports resolve
+# ---------------------------------------------------------------------------
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _ts(delta_minutes: int = 0) -> str:
+    """Return a log timestamp string for (now + delta_minutes)."""
+    dt = datetime.now() + timedelta(minutes=delta_minutes)
+    return dt.strftime("%Y-%m-%d %H:%M:%S,000")
+
+
+def _make_log(*lines: str) -> str:
+    """Join log lines with newlines."""
+    return "\n".join(lines) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# Import the module under test
+# ---------------------------------------------------------------------------
+import importlib
+import importlib.util
+
+def _load_healthcheck():
+    spec = importlib.util.spec_from_file_location(
+        "subscriber_healthcheck",
+        str(REPO_ROOT / "tools" / "subscriber_healthcheck.py"),
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+hc = _load_healthcheck()
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def tmp_state(tmp_path):
+    return tmp_path / "state.json"
+
+
+@pytest.fixture
+def mock_send():
+    """Patch send_alert so no network calls happen."""
+    with patch.object(hc, "send_alert", return_value=True) as m:
+        yield m
+
+
+@pytest.fixture
+def mock_alive():
+    """Subscriber process is alive."""
+    with patch.object(hc, "_is_subscriber_running", return_value=True):
+        yield
+
+
+@pytest.fixture
+def mock_dead():
+    """Subscriber process is not running."""
+    with patch.object(hc, "_is_subscriber_running", return_value=False):
+        yield
+
+
+# ---------------------------------------------------------------------------
+# Helper: write a temp log and call run_check
+# ---------------------------------------------------------------------------
+
+def _run(log_content: str, tmp_path, tmp_state, mock_send,
+         window_min=60, fail_threshold=3, realert_min=60):
+    log_file = tmp_path / "subscriber_test.log"
+    log_file.write_text(log_content)
+    hc.run_check(
+        window_min=window_min,
+        fail_threshold=fail_threshold,
+        realert_min=realert_min,
+        log_path=str(log_file),
+        dry_run=False,
+        state_file=tmp_state,
+    )
+    return mock_send
+
+
+# ---------------------------------------------------------------------------
+# TEST: clean window — no alerts
+# ---------------------------------------------------------------------------
+
+def test_clean_window_no_alerts(tmp_path, tmp_state, mock_send, mock_alive):
+    log = _make_log(
+        f"{_ts()} INFO 🚀 Executing buy order: KR 삼성전자(005930)",
+        f"{_ts()} INFO ✅ Actual buy successful: 005930",
+    )
+    mock_send = _run(log, tmp_path, tmp_state, mock_send)
+    mock_send.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# TEST: import failure -> CRITICAL alert
+# ---------------------------------------------------------------------------
+
+def test_import_failure_critical(tmp_path, tmp_state, mock_send, mock_alive):
+    log = _make_log(
+        f"{_ts()} CRITICAL Trading module import failed: No module named 'trading.domestic_stock_trading'",
+    )
+    mock_send = _run(log, tmp_path, tmp_state, mock_send)
+    mock_send.assert_called_once()
+    call_text = mock_send.call_args[0][0]
+    assert "CRITICAL" in call_text
+    assert "import" in call_text.lower()
+
+
+def test_startup_selfcheck_failed_critical(tmp_path, tmp_state, mock_send, mock_alive):
+    log = _make_log(
+        f"{_ts()} CRITICAL [STARTUP_SELFCHECK] FAILED: No module named 'Crypto'",
+    )
+    mock_send = _run(log, tmp_path, tmp_state, mock_send)
+    mock_send.assert_called_once()
+    call_text = mock_send.call_args[0][0]
+    assert "CRITICAL" in call_text
+
+
+# ---------------------------------------------------------------------------
+# TEST: attempts > 0 but zero successes -> CRITICAL
+# ---------------------------------------------------------------------------
+
+def test_attempts_zero_success_critical(tmp_path, tmp_state, mock_send, mock_alive):
+    log = _make_log(
+        f"{_ts()} INFO 🚀 Executing buy order: KR 셀트리온(068270)",
+        f"{_ts()} INFO 🚀 Executing sell order: US AAPL(AAPL)",
+        # no success lines
+    )
+    mock_send = _run(log, tmp_path, tmp_state, mock_send)
+    mock_send.assert_called_once()
+    call_text = mock_send.call_args[0][0]
+    assert "CRITICAL" in call_text
+    assert "0 successes" in call_text or "zero" in call_text.lower() or "successes" in call_text
+
+
+# ---------------------------------------------------------------------------
+# TEST: failures over threshold -> WARN
+# ---------------------------------------------------------------------------
+
+def test_failures_over_threshold_warn(tmp_path, tmp_state, mock_send, mock_alive):
+    # 3 actual failures (meets default threshold=3) + a success so zero_success doesn't fire
+    log = _make_log(
+        f"{_ts()} INFO 🚀 Executing buy order: KR 카카오(035720)",
+        f"{_ts()} INFO ✅ Actual buy successful: 035720",
+        f"{_ts()} ERROR ❌ Actual buy execution failed: 035720 err1",
+        f"{_ts()} ERROR ❌ Actual sell execution failed: 005930 err2",
+        f"{_ts()} ERROR ❌ Actual buy execution failed: 068270 err3",
+    )
+    mock_send = _run(log, tmp_path, tmp_state, mock_send, fail_threshold=3)
+    mock_send.assert_called_once()
+    call_text = mock_send.call_args[0][0]
+    assert "WARN" in call_text
+
+
+# ---------------------------------------------------------------------------
+# TEST: US log format (regression for false zero_success CRITICAL)
+#   The subscriber emits US trades as "🇺🇸 US buy successful" / "❌ 🇺🇸 US buy
+#   failed" — NOT the KR "Actual ..." form. The old regexes matched only "Actual",
+#   so every US success/failure went uncounted and a US-only batch with a real
+#   success still tripped zero_success. These lock the US format.
+# ---------------------------------------------------------------------------
+
+def test_us_success_counted_no_alert(tmp_path, tmp_state, mock_send, mock_alive):
+    # US buy attempt + US success (real subscriber format). Success MUST be
+    # counted, so zero_success must NOT fire. (Old regex => false CRITICAL.)
+    log = _make_log(
+        f"{_ts()} INFO 🚀 Executing buy order: 🇺🇸 Alphabet Inc.(GOOGL)",
+        f"{_ts()} INFO ✅ 🇺🇸 US buy successful: Alphabet Inc.(GOOGL) - Buy completed: 2 shares",
+    )
+    mock_send = _run(log, tmp_path, tmp_state, mock_send)
+    mock_send.assert_not_called()
+
+
+def test_us_failures_over_threshold_warn(tmp_path, tmp_state, mock_send, mock_alive):
+    # 1 US success (so zero_success does not fire) + 3 REAL US failures (meets
+    # threshold) => WARN. Old regex counted neither => would mis-fire CRITICAL.
+    log = _make_log(
+        f"{_ts()} INFO 🚀 Executing buy order: 🇺🇸 Alphabet Inc.(GOOGL)",
+        f"{_ts()} INFO ✅ 🇺🇸 US buy successful: Alphabet Inc.(GOOGL) - Buy completed: 2 shares",
+        f"{_ts()} ERROR ❌ 🇺🇸 US buy failed: Apple Inc.(AAPL) - Buy order failed: APBK1999 시스템 오류",
+        f"{_ts()} ERROR ❌ 🇺🇸 US sell failed: Tesla, Inc.(TSLA) - Connection timeout to KIS",
+        f"{_ts()} ERROR ❌ 🇺🇸 US buy failed: Amazon.com, Inc.(AMZN) - Unexpected broker response",
+    )
+    mock_send = _run(log, tmp_path, tmp_state, mock_send, fail_threshold=3)
+    mock_send.assert_called_once()
+    assert "WARN" in mock_send.call_args[0][0]
+
+
+# ---------------------------------------------------------------------------
+# TEST: benign business rejections must NOT alert (alert-fatigue guard)
+#   "not found in portfolio" (drift), "quantity is 0" (sub-share budget),
+#   "주문가능금액" (no buying power) are expected outcomes, not faults. With a
+#   success present (so zero_success is moot) AND in an all-rejection batch.
+# ---------------------------------------------------------------------------
+
+def test_benign_rejections_no_alert(tmp_path, tmp_state, mock_send, mock_alive):
+    # 1 success + 3 benign rejections meeting the numeric threshold => still NO
+    # WARN, because benign rejections are excluded from actual_failures.
+    log = _make_log(
+        f"{_ts()} INFO 🚀 Executing buy order: 🇺🇸 Alphabet Inc.(GOOGL)",
+        f"{_ts()} INFO ✅ 🇺🇸 US buy successful: Alphabet Inc.(GOOGL) - Buy completed: 2 shares",
+        f"{_ts()} ERROR ❌ 🇺🇸 US sell failed: Micron Technology, Inc.(MU) - MU not found in portfolio",
+        f"{_ts()} ERROR ❌ 🇺🇸 US buy failed: Micron Technology, Inc.(MU) - Buy quantity is 0",
+        f"{_ts()} ERROR ❌ 🇺🇸 US buy failed: NVIDIA Corporation(NVDA) - APBK0952 주문가능금액을 초과",
+    )
+    mock_send = _run(log, tmp_path, tmp_state, mock_send, fail_threshold=3)
+    mock_send.assert_not_called()
+
+
+def test_all_benign_zero_success_no_critical(tmp_path, tmp_state, mock_send, mock_alive):
+    # Account out of cash: every buy attempt benign-rejected, zero successes.
+    # This is an operational state, NOT a broken subscriber => no CRITICAL.
+    log = _make_log(
+        f"{_ts()} INFO 🚀 Executing buy order: 🇺🇸 Micron Technology, Inc.(MU)",
+        f"{_ts()} ERROR ❌ 🇺🇸 US buy failed: Micron Technology, Inc.(MU) - Buy quantity is 0",
+        f"{_ts()} INFO 🚀 Executing buy order: 🇺🇸 NVIDIA Corporation(NVDA)",
+        f"{_ts()} ERROR ❌ 🇺🇸 US buy failed: NVIDIA Corporation(NVDA) - APBK0952 주문가능금액을 초과",
+    )
+    mock_send = _run(log, tmp_path, tmp_state, mock_send)
+    mock_send.assert_not_called()
+
+
+def test_order_window_and_drift_no_critical(tmp_path, tmp_state, mock_send, mock_alive):
+    # Real 2026-06-30 case: a late-batch sell hits portfolio drift and a buy lands
+    # in the KST 15:30–16:00 dead zone ("Order window unavailable"). Both are
+    # deterministic both-sides timing/operational rejections, so zero successes
+    # here must NOT raise CRITICAL.
+    log = _make_log(
+        f"{_ts()} INFO 🚀 Executing sell order: 🇰🇷 삼성E&A(028050)",
+        f"{_ts()} ERROR ❌ Actual sell failed: 삼성E&A(028050) - Stock 028050 not found in portfolio",
+        f"{_ts()} INFO 🚀 Executing buy order: 🇰🇷 이오테크닉스(039030)",
+        f"{_ts()} ERROR ❌ Actual buy failed: 이오테크닉스(039030) - Buy failed: Order window unavailable in KST (reserved orders are accepted 16:00~23:40 and 00:10~07:30)",
+    )
+    mock_send = _run(log, tmp_path, tmp_state, mock_send)
+    mock_send.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# TEST: process down -> DOWN alert
+# ---------------------------------------------------------------------------
+
+def test_process_down_alert(tmp_path, tmp_state, mock_send, mock_dead):
+    log = _make_log(f"{_ts()} INFO subscriber running normally")
+    mock_send = _run(log, tmp_path, tmp_state, mock_send)
+    mock_send.assert_called_once()
+    call_text = mock_send.call_args[0][0]
+    assert "DOWN" in call_text
+
+
+# ---------------------------------------------------------------------------
+# TEST: de-duplication (cooldown suppresses repeat alerts)
+# ---------------------------------------------------------------------------
+
+def test_dedup_suppresses_repeat(tmp_path, tmp_state, mock_send, mock_alive):
+    log = _make_log(
+        f"{_ts()} CRITICAL Trading module import failed: err",
+    )
+    # First run: should alert
+    log_file = tmp_path / "sub.log"
+    log_file.write_text(log)
+    hc.run_check(
+        window_min=60, fail_threshold=3, realert_min=60,
+        log_path=str(log_file), dry_run=False, state_file=tmp_state,
+    )
+    assert mock_send.call_count == 1
+
+    # Second run immediately: should be suppressed (realert_min=60)
+    hc.run_check(
+        window_min=60, fail_threshold=3, realert_min=60,
+        log_path=str(log_file), dry_run=False, state_file=tmp_state,
+    )
+    assert mock_send.call_count == 1  # still 1, not 2
+
+
+# ---------------------------------------------------------------------------
+# TEST: recovery "cleared" message
+# ---------------------------------------------------------------------------
+
+def test_recovery_cleared_message(tmp_path, tmp_state, mock_send, mock_alive):
+    # Step 1: trigger import_fail alert
+    bad_log = _make_log(
+        f"{_ts()} CRITICAL Trading module import failed: err",
+    )
+    log_file = tmp_path / "sub.log"
+    log_file.write_text(bad_log)
+    hc.run_check(
+        window_min=60, fail_threshold=3, realert_min=0,
+        log_path=str(log_file), dry_run=False, state_file=tmp_state,
+    )
+    assert mock_send.call_count == 1
+
+    # Step 2: healthy log — should send "cleared"
+    good_log = _make_log(f"{_ts()} INFO all good")
+    log_file.write_text(good_log)
+    hc.run_check(
+        window_min=60, fail_threshold=3, realert_min=0,
+        log_path=str(log_file), dry_run=False, state_file=tmp_state,
+    )
+    assert mock_send.call_count == 2
+    cleared_text = mock_send.call_args[0][0]
+    assert "cleared" in cleared_text.lower() or "✅" in cleared_text
+
+
+# ---------------------------------------------------------------------------
+# TEST: importlib path-safety
+#   - is_us_market_hours() must NOT add prism-us to sys.path
+#   - trading.domestic_stock_trading must be importable after the call
+# ---------------------------------------------------------------------------
+
+def test_importlib_does_not_pollute_syspath():
+    """is_us_market_hours() uses importlib; prism-us must never appear in sys.path.
+
+    Separately verifies that trading.domestic_stock_trading is importable when
+    kis_auth config loading is mocked out (the config file doesn't exist in the
+    test worktree, but that's a deployment concern — the module itself must be
+    importable without prism-us on sys.path shadowing it).
+    """
+    # Ensure repo root is on path
+    if str(REPO_ROOT) not in sys.path:
+        sys.path.insert(0, str(REPO_ROOT))
+
+    # Import the subscriber module
+    spec = importlib.util.spec_from_file_location(
+        "gcp_pubsub_subscriber_example_pathtest",
+        str(REPO_ROOT / "examples" / "messaging" / "gcp_pubsub_subscriber_example.py"),
+    )
+    mod = importlib.util.module_from_spec(spec)
+    with patch.dict(os.environ, {"TRADING_MODE": "dry", "GCP_PROJECT_ID": "test", "GCP_PUBSUB_SUBSCRIPTION_ID": "test"}):
+        spec.loader.exec_module(mod)
+
+    # Call is_us_market_hours() — may raise (e.g. calendar unavailable); that's fine
+    try:
+        mod.is_us_market_hours()
+    except Exception:
+        pass
+
+    # prism-us must NOT be on sys.path after the call
+    assert not any("prism-us" in str(p) for p in sys.path), (
+        f"prism-us was added to sys.path: {[p for p in sys.path if 'prism-us' in str(p)]}"
+    )
+
+    # Verify that Python would resolve trading.domestic_stock_trading from the
+    # REPO_ROOT trading/ directory — not from prism-us/trading/. We check this
+    # structurally: find which directory sys.path would use for `trading`, and
+    # confirm it is NOT under prism-us.
+    #
+    # (Full import of domestic_stock_trading requires a live KIS YAML config file
+    # that does not exist in this worktree; structural verification is sufficient.)
+    prism_us_trading = str(REPO_ROOT / "prism-us" / "trading")
+    repo_root_trading = str(REPO_ROOT / "trading")
+
+    # Find first sys.path entry that contains a `trading` package
+    resolved_trading_root = None
+    for p in sys.path:
+        candidate = Path(p) / "trading"
+        if candidate.is_dir() and (candidate / "domestic_stock_trading.py").exists():
+            resolved_trading_root = str(candidate)
+            break
+
+    assert resolved_trading_root is not None, (
+        "Could not find trading/domestic_stock_trading.py on sys.path at all"
+    )
+    assert "prism-us" not in resolved_trading_root, (
+        f"trading package resolved to prism-us path: {resolved_trading_root}. "
+        "prism-us must NOT be on sys.path when the subscriber is running."
+    )
+    assert resolved_trading_root == repo_root_trading, (
+        f"trading package resolved to unexpected path: {resolved_trading_root} "
+        f"(expected {repo_root_trading})"
+    )

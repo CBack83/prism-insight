@@ -9,7 +9,6 @@ from stock_tracking_agent import StockTrackingAgent
 import logging
 import json
 import traceback
-import re
 
 from mcp_agent.workflows.llm.augmented_llm import RequestParams
 from cores.llm.openai_responses_llm import OpenAIResponsesLLM as OpenAIAugmentedLLM
@@ -407,6 +406,7 @@ class EnhancedStockTrackingAgent(StockTrackingAgent):
                 sector_diverse = analysis_result.get("sector_diverse", True)
                 rank_change_percentage = analysis_result.get("rank_change_percentage", 0)
                 rank_change_msg = analysis_result.get("rank_change_msg", "")
+                is_add = analysis_result.get("is_add", False)  # pyramiding (#288)
 
                 # Check entry decision
                 buy_score = scenario.get("buy_score", 0)
@@ -468,11 +468,20 @@ class EnhancedStockTrackingAgent(StockTrackingAgent):
                             market_condition_text = market_condition_text.replace(eng, ko, 1)
                             break
 
+                    # When the AI decided "Enter" but the trade was still deferred
+                    # (e.g., sector concentration cap), surface the contradiction on the
+                    # decision line itself. The standalone "보류 사유" line several rows
+                    # below is easy to miss, which made an Enter+hold look like a bug.
+                    if decision == "Enter":
+                        decision_display = f"Enter (실제 보류 — 사유: {reason})"
+                    else:
+                        decision_display = decision
+
                     # Generate skip message
                     skip_message = f"⚠️ 매수 보류: {company_name}({ticker})\n" \
                                    f"현재가: {current_price:,.0f}원\n" \
                                    f"매수 Score: {buy_score}/10\n" \
-                                   f"결정: {decision}\n" \
+                                   f"결정: {decision_display}\n" \
                                    f"시장 상황: {market_condition_text}\n" \
                                    f"산업군: {scenario.get('sector', '알 수 없음')}\n" \
                                    f"보류 사유: {reason}\n" \
@@ -484,6 +493,19 @@ class EnhancedStockTrackingAgent(StockTrackingAgent):
                     trigger_win_rate = self._get_trigger_win_rate(trigger_type_for_rate)
                     if trigger_win_rate:
                         skip_message += f"\n{trigger_win_rate}"
+
+                    # Surface journal-grounded reasoning so the feedback loop is transparent (#280).
+                    # All fields optional — defends against scenarios without journal_reflection.
+                    _jr = scenario.get('journal_reflection') or {}
+                    if isinstance(_jr, dict):
+                        if _jr.get('recent_exit_caution'):
+                            skip_message += f"\n⚠️ 최근 매도 주의: {_jr.get('recent_exit_caution')}"
+                        if _jr.get('applied_lessons'):
+                            skip_message += f"\n📒 매매일지 반영: {_jr.get('applied_lessons')}"
+                    _sadj = scenario.get('score_adjustment') or {}
+                    if isinstance(_sadj, dict) and _sadj.get('value'):
+                        _rsn = ', '.join(_sadj.get('reasons', []) or [])
+                        skip_message += f"\n📊 경험 기반 점수조정: {_sadj.get('value'):+d}점 ({_rsn})"
 
                     self._msg_types.append("analysis")
                     self.message_queue.append(skip_message)
@@ -506,8 +528,8 @@ class EnhancedStockTrackingAgent(StockTrackingAgent):
 
                 # Process buy if entry decision
                 if decision == "Enter" and buy_score >= min_score and sector_diverse:
-                    # Process buy
-                    buy_success = await self.buy_stock(ticker, company_name, current_price, scenario, rank_change_msg)
+                    # Process buy (is_add => pyramiding additional independent row, #288)
+                    buy_success = await self.buy_stock(ticker, company_name, current_price, scenario, rank_change_msg, is_add=is_add)
 
                     if buy_success:
                         # Call actual account trading function (async)
@@ -565,9 +587,11 @@ class EnhancedStockTrackingAgent(StockTrackingAgent):
             logger.error(traceback.format_exc())
             return 0, 0
 
-    async def buy_stock(self, ticker: str, company_name: str, current_price: float, scenario: Dict[str, Any], rank_change_msg: str = "") -> bool:
+    async def buy_stock(self, ticker: str, company_name: str, current_price: float, scenario: Dict[str, Any], rank_change_msg: str = "", is_add: bool = False) -> bool:
         """
         Stock buy processing (override parent class method)
+
+        is_add: pyramiding add (#288) — passed through to the parent buy path.
         """
         try:
             # Calculate dynamically if target price/stop-loss is missing or 0 in scenario
@@ -582,7 +606,7 @@ class EnhancedStockTrackingAgent(StockTrackingAgent):
                 logger.info(f"{ticker} Dynamic stop-loss calculated: {stop_loss:,.0f} KRW")
 
             # Call parent class's buy_stock method
-            return await super().buy_stock(ticker, company_name, current_price, scenario, rank_change_msg)
+            return await super().buy_stock(ticker, company_name, current_price, scenario, rank_change_msg, is_add=is_add)
 
         except Exception as e:
             logger.error(f"{ticker} Error during purchase processing: {str(e)}")
@@ -771,6 +795,23 @@ class EnhancedStockTrackingAgent(StockTrackingAgent):
             target_price = stock_data.get('target_price', 0)
             stop_loss = stock_data.get('stop_loss', 0)
 
+            # ── TIER0: 법인 이벤트 강제청산 (AI 판단 이전, 결정론 안전망) ──────
+            # KIS 관리종목(51) 자동탐지 + (선택)override 목록. AI 매도 프롬프트의
+            # 핵심-0 뉴스 판단이 놓쳐도 명백한 부실/등록 건은 여기서 확정 청산한다.
+            # _kis_stat_code는 update_holdings가 사이클당 주입 → 운영자 개입 불필요.
+            try:
+                from cores.corporate_status import check_event_exit
+                ev_sell, ev_reason = check_event_exit(
+                    ticker,
+                    kis_status_code=stock_data.get("_kis_stat_code"),
+                    market="KR",
+                )
+                if ev_sell:
+                    logger.warning(f"{ticker} TIER0 event force-exit: {ev_reason}")
+                    return True, ev_reason
+            except Exception as e:
+                logger.warning(f"{ticker} TIER0 event check skipped: {e}")
+
             # Calculate profit rate
             profit_rate = ((current_price - buy_price) / buy_price) * 100
 
@@ -809,10 +850,20 @@ class EnhancedStockTrackingAgent(StockTrackingAgent):
                         highest_price = current_price
                         scenario_data['highest_price'] = highest_price
                         updated_scenario_str = json.dumps(scenario_data, ensure_ascii=False)
-                        self.cursor.execute(
-                            "UPDATE stock_holdings SET scenario = ? WHERE ticker = ?",
-                            (updated_scenario_str, ticker)
-                        )
+                        # Pyramiding (#288): scope by row id so only THIS row's
+                        # scenario is updated (multi-row tickers). Fall back to
+                        # ticker when id is unavailable (legacy callers).
+                        row_id = stock_data.get('id')
+                        if row_id is not None:
+                            self.cursor.execute(
+                                "UPDATE stock_holdings SET scenario = ? WHERE id = ?",
+                                (updated_scenario_str, row_id)
+                            )
+                        else:
+                            self.cursor.execute(
+                                "UPDATE stock_holdings SET scenario = ? WHERE ticker = ?",
+                                (updated_scenario_str, ticker)
+                            )
                         self.conn.commit()
                         logger.info(f"{ticker} highest_price updated in scenario: {highest_price:,.0f} KRW")
             except:
@@ -1019,7 +1070,7 @@ class EnhancedStockTrackingAgent(StockTrackingAgent):
 
                         # Process portfolio_adjustment
                         if portfolio_adjustment.get("needed", False):
-                            await self._process_portfolio_adjustment(ticker, company_name, portfolio_adjustment, analysis_summary, current_price)
+                            await self._process_portfolio_adjustment(ticker, company_name, portfolio_adjustment, analysis_summary, current_price, row_id=stock_data.get('id'))
                 except Exception as db_err:
                     # Main flow continues even if DB operation fails
                     logger.error(f"{ticker} Error processing holding_decisions DB (main flow continues): {str(db_err)}")
@@ -1137,8 +1188,13 @@ class EnhancedStockTrackingAgent(StockTrackingAgent):
             logger.error(f"Error in fallback sell analysis: {str(e)}")
             return False, "Analysis error"
 
-    async def _process_portfolio_adjustment(self, ticker: str, company_name: str, portfolio_adjustment: Dict[str, Any], analysis_summary: Dict[str, Any], current_price: float = 0):
-        """Process DB updates and Telegram notifications based on portfolio_adjustment"""
+    async def _process_portfolio_adjustment(self, ticker: str, company_name: str, portfolio_adjustment: Dict[str, Any], analysis_summary: Dict[str, Any], current_price: float = 0, row_id: int = None):
+        """Process DB updates and Telegram notifications based on portfolio_adjustment
+
+        row_id: pyramiding (#288) — when provided, all UPDATEs/SELECT target only
+                this specific holding row (multi-row correctness). Falls back to
+                ticker-scoped queries when None (legacy/single-row).
+        """
         try:
             # Return if adjustment not needed
             if not portfolio_adjustment.get("needed", False):
@@ -1151,10 +1207,16 @@ class EnhancedStockTrackingAgent(StockTrackingAgent):
                 return
 
             # Verify holding exists in DB before processing
-            self.cursor.execute(
-                "SELECT target_price, stop_loss FROM stock_holdings WHERE ticker = ?",
-                (ticker,)
-            )
+            if row_id is not None:
+                self.cursor.execute(
+                    "SELECT target_price, stop_loss FROM stock_holdings WHERE id = ?",
+                    (row_id,)
+                )
+            else:
+                self.cursor.execute(
+                    "SELECT target_price, stop_loss FROM stock_holdings WHERE ticker = ?",
+                    (ticker,)
+                )
             row = self.cursor.fetchone()
             if row is None:
                 logger.warning(f"{ticker} stock_holdings SELECT returned None - skipping adjustment")
@@ -1172,10 +1234,16 @@ class EnhancedStockTrackingAgent(StockTrackingAgent):
                 # Safe number conversion (including comma removal)
                 target_price_num = self._safe_number_conversion(new_target_price)
                 if target_price_num > 0:
-                    self.cursor.execute(
-                        "UPDATE stock_holdings SET target_price = ? WHERE ticker = ?",
-                        (target_price_num, ticker)
-                    )
+                    if row_id is not None:
+                        self.cursor.execute(
+                            "UPDATE stock_holdings SET target_price = ? WHERE id = ?",
+                            (target_price_num, row_id)
+                        )
+                    else:
+                        self.cursor.execute(
+                            "UPDATE stock_holdings SET target_price = ? WHERE ticker = ?",
+                            (target_price_num, ticker)
+                        )
                     self.conn.commit()
                     db_updated = True
                     if target_price_num == old_target_price:
@@ -1210,10 +1278,16 @@ class EnhancedStockTrackingAgent(StockTrackingAgent):
                             f"{stop_loss_num:,.0f} < {old_stop_loss:,.0f} KRW — 무시합니다."
                         )
                     else:
-                        self.cursor.execute(
-                            "UPDATE stock_holdings SET stop_loss = ? WHERE ticker = ?",
-                            (stop_loss_num, ticker)
-                        )
+                        if row_id is not None:
+                            self.cursor.execute(
+                                "UPDATE stock_holdings SET stop_loss = ? WHERE id = ?",
+                                (stop_loss_num, row_id)
+                            )
+                        else:
+                            self.cursor.execute(
+                                "UPDATE stock_holdings SET stop_loss = ? WHERE ticker = ?",
+                                (stop_loss_num, ticker)
+                            )
                         self.conn.commit()
                         db_updated = True
                         if stop_loss_num == old_stop_loss:

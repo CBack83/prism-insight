@@ -7,15 +7,22 @@ Extracted from stock_tracking_agent.py for LLM context efficiency.
 
 import json
 import logging
+import os
 import re
+import sys
 import traceback
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from cores.openai_error_logging import log_openai_error
 from cores.utils import parse_llm_json
 
 logger = logging.getLogger(__name__)
+
+# Recent stop-out churn guard — env-configurable, fail-open
+JOURNAL_RECENT_LOSS_HOURS = float(os.getenv("JOURNAL_RECENT_LOSS_HOURS", "48"))
+JOURNAL_RECENT_LOSS_PENALTY = int(os.getenv("JOURNAL_RECENT_LOSS_PENALTY", "2"))
 
 
 class JournalManager:
@@ -85,19 +92,39 @@ class JournalManager:
             # Create journal agent
             journal_agent = create_trading_journal_agent(self.language)
 
-            async with journal_agent:
-                llm = await journal_agent.attach_llm(OpenAIAugmentedLLM)
+            # Build prompt once — shared by both execution paths
+            prompt = self._build_analysis_prompt(
+                company_name, ticker, buy_price, buy_date,
+                scenario_data, sell_price, profit_rate, holding_days, sell_reason
+            )
 
-                prompt = self._build_analysis_prompt(
-                    company_name, ticker, buy_price, buy_date,
-                    scenario_data, sell_price, profit_rate, holding_days, sell_reason
+            import os as _os
+            if _os.getenv("LLM_BACKEND", "mcp_agent") == "openai_agents":
+                from cores.llm.agent_bridge import (
+                    ensure_openai_agents_configured,
+                    get_llm_backend,
+                    spec_from_mcp_agent,
                 )
+                from cores.llm.config_loader import load_mcp_registry
+                from cores.llm.ports import LLMParams
 
-                response = await llm.generate_str(
-                    message=prompt,
-                    request_params=RequestParams(model="gpt-5.4-mini", reasoning_effort="none", maxTokens=16000)
+                ensure_openai_agents_configured()
+                registry = load_mcp_registry()
+                spec = spec_from_mcp_agent(
+                    journal_agent,
+                    model="gpt-5.4-mini",
+                    params=LLMParams(max_tokens=16000, reasoning_effort="none"),
                 )
-                logger.info(f"Journal agent response received: {len(response)} chars")
+                result = await get_llm_backend(registry).run(spec, prompt)
+                response = result.text
+            else:
+                async with journal_agent:
+                    llm = await journal_agent.attach_llm(OpenAIAugmentedLLM)
+                    response = await llm.generate_str(
+                        message=prompt,
+                        request_params=RequestParams(model="gpt-5.4-mini", reasoning_effort="none", maxTokens=16000)
+                    )
+            logger.info(f"Journal agent response received: {len(response)} chars")
 
             # Parse and save
             journal_data = self._parse_response(response)
@@ -496,9 +523,22 @@ Please review the following completed trade:
                     pass
 
                 profit_emoji = "✅" if entry[2] > 0 else "❌"
+                # Recency framing: flag names exited within the last ~5 trading days
+                # (≈7 calendar days) so the buy LLM does not overlook that it just
+                # closed this very stock (the same-day re-buy churn case, #282).
+                recency_tag = ""
+                try:
+                    exit_date = datetime.strptime(entry[7][:10], "%Y-%m-%d")
+                    days_since = (datetime.now() - exit_date).days
+                    if days_since <= 7:
+                        recency_tag = f" ⚠️ {days_since}일 전 매도 — 추격 재진입 신중 검토"
+                    else:
+                        recency_tag = f" ({days_since}일 전)"
+                except Exception:
+                    pass
                 context_parts.append(
                     f"- [{entry[7][:10]}] {profit_emoji} Return {entry[2]:.1f}% "
-                    f"(held {entry[3]} days) - {entry[4]}{lessons_str}"
+                    f"(held {entry[3]} days) - {entry[4]}{lessons_str}{recency_tag}"
                 )
 
                 # Enrich with sell context so the buy LLM understands WHY the stock was exited
@@ -647,6 +687,27 @@ Please review the following completed trade:
                                 f"Trigger '{trigger_type}' high win rate "
                                 f"{t['win_rate']*100:.0f}% (n={t['total']}, actual 30d data)"
                             )
+
+            # Recent stop-out churn guard (KR market)
+            # Must come last so it can cancel any net-positive bonus from above.
+            if JOURNAL_RECENT_LOSS_PENALTY > 0:
+                try:
+                    # Import reentry_cooldown from repo root (works under both runtimes)
+                    _rc_root = str(Path(__file__).resolve().parent.parent)
+                    if _rc_root not in sys.path:
+                        sys.path.insert(0, _rc_root)
+                    import reentry_cooldown as _rc
+                    # risk-exit aware (loss OR stop/trend-exit); falls back to
+                    # loss-only on an older reentry_cooldown build.
+                    _loss_info = getattr(_rc, "recent_risk_exit", _rc.recent_loss)(ticker, market="KR")
+                    if _loss_info is not None and _loss_info["gap_hours"] <= JOURNAL_RECENT_LOSS_HOURS:
+                        adjustment = min(adjustment, 0) - JOURNAL_RECENT_LOSS_PENALTY
+                        reasons.append(
+                            f"Recent stop-out {_loss_info['gap_hours']:.1f}h ago "
+                            f"({_loss_info['last_ret']:.1f}%) — churn guard"
+                        )
+                except Exception:
+                    pass  # fail-open: never raise into the buy path
 
             return max(-3, min(3, adjustment)), reasons
 

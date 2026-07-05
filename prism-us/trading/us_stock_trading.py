@@ -95,6 +95,25 @@ def _safe_int(value, default: int = 0) -> int:
     except (ValueError, TypeError):
         return default
 
+
+def _resolve_sell_quantity(holding_quantity: int, quantity: int = None) -> int:
+    """Resolve the number of shares to sell (US, #288).
+
+    When ``quantity`` is None the full holding is sold (unchanged behavior).
+    When given, the requested partial quantity is used, clamped to
+    [1, holding_quantity] to avoid over-selling.
+    """
+    if quantity is None:
+        return holding_quantity
+    try:
+        q = int(quantity)
+    except (TypeError, ValueError):
+        return holding_quantity
+    if q <= 0:
+        return holding_quantity
+    return min(q, holding_quantity)
+
+
 # Exchange code mapping (for trading/portfolio APIs using OVRS_EXCG_CD)
 EXCHANGE_CODES = {
     "NASDAQ": "NASD",
@@ -277,7 +296,7 @@ class USStockTrading:
         self._semaphore = asyncio.Semaphore(3)
         self._stock_locks = {}
 
-        logger.info(f"USStockTrading initialized (Async Enabled)")
+        logger.info("USStockTrading initialized (Async Enabled)")
         logger.info(f"Mode: {mode}, Buy Amount: ${self.buy_amount:,.2f} USD")
         logger.info(f"Account: {self.account_name} ({ka.mask_account_number(self.trenv.my_acct)}-{self.trenv.my_prod})")
 
@@ -697,9 +716,9 @@ class USStockTrading:
         return 0
 
     def sell_all_market_price(self, ticker: str, exchange: str = None,
-                              limit_price: float = None) -> Dict[str, Any]:
+                              limit_price: float = None, quantity: int = None) -> Dict[str, Any]:
         """
-        Sell all holdings at current market price (limit order at current price).
+        Sell holdings at current market price (limit order at current price).
 
         KIS TTTT1006U does not support ORD_DVSN "01" (market order) for sell.
         Valid values: 00=limit, 31=MOO, 32=LOO, 33=MOC, 34=LOC.
@@ -711,6 +730,7 @@ class USStockTrading:
             exchange: Exchange code
             limit_price: Current price to use as limit price. If not provided,
                          fetched automatically.
+            quantity: Partial sell quantity (None = full holding, unchanged).
 
         Returns:
             Order result dict
@@ -730,9 +750,9 @@ class USStockTrading:
             exchange = EXCHANGE_CODES.get(exchange.upper(), exchange)
 
         # Check holding quantity
-        quantity = self.get_holding_quantity(ticker)
+        holding_quantity = self.get_holding_quantity(ticker)
 
-        if quantity == 0:
+        if holding_quantity == 0:
             return {
                 'success': False,
                 'order_no': None,
@@ -740,6 +760,9 @@ class USStockTrading:
                 'quantity': 0,
                 'message': 'No holdings to sell'
             }
+
+        # Determine sell quantity (partial when quantity given, else full holding)
+        quantity = _resolve_sell_quantity(holding_quantity, quantity)
 
         # Fetch current price if not provided
         if not limit_price or limit_price <= 0:
@@ -842,7 +865,6 @@ class USStockTrading:
         Returns:
             True if reserved order can be placed, False otherwise
         """
-        import pytz
         now_kst = datetime.datetime.now(KST)
         current_time = now_kst.time()
 
@@ -1077,7 +1099,7 @@ class USStockTrading:
             }
 
     def sell_reserved_order(self, ticker: str, limit_price: float = None,
-                            use_moo: bool = False, exchange: str = None) -> Dict[str, Any]:
+                            use_moo: bool = False, exchange: str = None, quantity: int = None) -> Dict[str, Any]:
         """
         Reserved order sell for US stock (executed at next market open)
         Reserved sell order - automatically executed at next market open
@@ -1089,6 +1111,10 @@ class USStockTrading:
             limit_price: Limit price in USD (required if use_moo is False)
             use_moo: Use Market On Open order (default: False)
             exchange: Exchange code
+            quantity: Partial sell quantity (None = full holding, unchanged).
+                      NOTE: when the order must be queued for the pending-order
+                      batch (outside reserved-order window), the queued order
+                      liquidates the full holding (partial not supported there).
 
         Returns:
             Order result dict
@@ -1124,9 +1150,9 @@ class USStockTrading:
             )
 
         # Check holding quantity
-        quantity = self.get_holding_quantity(ticker)
+        holding_quantity = self.get_holding_quantity(ticker)
 
-        if quantity == 0:
+        if holding_quantity == 0:
             return {
                 'success': False,
                 'order_no': None,
@@ -1134,6 +1160,9 @@ class USStockTrading:
                 'quantity': 0,
                 'message': 'No holdings to sell'
             }
+
+        # Determine sell quantity (partial when quantity given, else full holding)
+        quantity = _resolve_sell_quantity(holding_quantity, quantity)
 
         # Reserved order API
         api_url = "/uapi/overseas-stock/v1/trading/order-resv"
@@ -1262,7 +1291,7 @@ class USStockTrading:
                 }
 
     def smart_sell_all(self, ticker: str, exchange: str = None,
-                       limit_price: float = None, use_moo: bool = False) -> Dict[str, Any]:
+                       limit_price: float = None, use_moo: bool = False, quantity: int = None) -> Dict[str, Any]:
         """
         Smart sell - automatically choose best method based on market hours
 
@@ -1276,6 +1305,7 @@ class USStockTrading:
             exchange: Exchange code
             limit_price: Limit price for reserved order when market is closed
             use_moo: Use Market On Open for reserved order (default: False)
+            quantity: Partial sell quantity (None = full holding, unchanged behavior)
 
         Returns:
             Order result dict
@@ -1291,15 +1321,15 @@ class USStockTrading:
 
         if self.is_market_open():
             logger.info(f"[{ticker}] Market is open - executing market sell")
-            return self.sell_all_market_price(ticker, exchange, limit_price=limit_price)
+            return self.sell_all_market_price(ticker, exchange, limit_price=limit_price, quantity=quantity)
         else:
             # Market is closed - use reserved order
             if limit_price and limit_price > 0:
                 logger.info(f"[{ticker}] Market is closed - placing reserved sell order (limit: ${limit_price:.2f})")
-                return self.sell_reserved_order(ticker, limit_price, use_moo=False, exchange=exchange)
+                return self.sell_reserved_order(ticker, limit_price, use_moo=False, exchange=exchange, quantity=quantity)
             elif use_moo:
                 logger.info(f"[{ticker}] Market is closed - placing reserved MOO sell order")
-                return self.sell_reserved_order(ticker, limit_price=None, use_moo=True, exchange=exchange)
+                return self.sell_reserved_order(ticker, limit_price=None, use_moo=True, exchange=exchange, quantity=quantity)
             else:
                 logger.warning(f"[{ticker}] Market is closed and no limit_price/use_moo provided")
                 return {
@@ -1438,7 +1468,7 @@ class USStockTrading:
 
     async def async_sell_stock(self, ticker: str, exchange: str = None,
                                timeout: float = 30.0, limit_price: Optional[float] = None,
-                               use_moo: bool = False) -> Dict[str, Any]:
+                               use_moo: bool = False, quantity: Optional[int] = None) -> Dict[str, Any]:
         """
         Async sell API with timeout
 
@@ -1448,13 +1478,14 @@ class USStockTrading:
             timeout: Timeout in seconds
             limit_price: Limit price for reserved order when market is closed
             use_moo: Use Market On Open for reserved order
+            quantity: Partial sell quantity (None = full holding, unchanged behavior)
 
         Returns:
             Order result dict
         """
         try:
             return await asyncio.wait_for(
-                self._execute_sell_stock(ticker, exchange, limit_price, use_moo),
+                self._execute_sell_stock(ticker, exchange, limit_price, use_moo, quantity=quantity),
                 timeout=timeout
             )
         except asyncio.TimeoutError:
@@ -1470,8 +1501,11 @@ class USStockTrading:
             }
 
     async def _execute_sell_stock(self, ticker: str, exchange: str = None,
-                                  limit_price: float = None, use_moo: bool = False) -> Dict[str, Any]:
-        """Execute sell stock logic with portfolio verification"""
+                                  limit_price: float = None, use_moo: bool = False, quantity: int = None) -> Dict[str, Any]:
+        """Execute sell stock logic with portfolio verification
+
+        quantity: partial sell quantity (None = full holding, unchanged behavior)
+        """
         result = {
             'success': False,
             'ticker': ticker,
@@ -1530,11 +1564,14 @@ class USStockTrading:
                             logger.warning(f"[Async Sell] {ticker} no valid limit_price, using MOO")
                             effective_use_moo = True
 
-                        logger.info(f"[Async Sell] {ticker} limit_price: ${effective_limit_price:.2f}, use_moo: {effective_use_moo}")
+                        # Resolve partial sell quantity (None = full holding)
+                        sell_quantity = _resolve_sell_quantity(target_stock['quantity'], quantity)
+
+                        logger.info(f"[Async Sell] {ticker} limit_price: ${effective_limit_price:.2f}, use_moo: {effective_use_moo}, qty: {sell_quantity}/{target_stock['quantity']}")
 
                         # Execute sell
                         sell_result = await asyncio.to_thread(
-                            self.smart_sell_all, ticker, exchange, effective_limit_price if effective_limit_price > 0 else None, effective_use_moo
+                            self.smart_sell_all, ticker, exchange, effective_limit_price if effective_limit_price > 0 else None, effective_use_moo, sell_quantity
                         )
 
                         if sell_result['success']:
@@ -1682,15 +1719,20 @@ class USStockTrading:
                 output2 = body.output2 if hasattr(body, 'output2') else []
                 output3 = body.output3 if hasattr(body, 'output3') else {}
 
-                # Extract USD info from output2
+                # Extract USD info from output2. unsettled buy/sell amounts let us put cash
+                # on a trade-date basis (see total_asset_usd below).
                 usd_cash = 0.0
                 exchange_rate = 0.0
+                unsettled_buy = 0.0   # executed buys not yet settled (cash not yet debited)
+                unsettled_sell = 0.0  # executed sells not yet settled (proceeds not yet credited)
 
                 if output2 and isinstance(output2, list):
                     for item in output2:
                         if item.get('crcy_cd') == 'USD':
                             usd_cash = _safe_float(item.get('frcr_dncl_amt_2'))
                             exchange_rate = _safe_float(item.get('frst_bltn_exrt'))
+                            unsettled_buy = _safe_float(item.get('frcr_buy_amt_smtl'))
+                            unsettled_sell = _safe_float(item.get('frcr_sll_amt_smtl'))
                             break
 
                 # Calculate from portfolio for stock totals
@@ -1699,6 +1741,16 @@ class USStockTrading:
                 total_profit = sum(s['profit_amount'] for s in portfolio)
                 total_cost = sum(s['avg_price'] * s['quantity'] for s in portfolio)
 
+                # USD-denominated total assets on a trade-date basis (excludes KRW cash).
+                # frcr_dncl_amt_2 is settlement-based (D+2), so summing it against a
+                # real-time stock eval makes the season return see-saw: a sell drops eval
+                # immediately but its proceeds reach the deposit days later. Adding net
+                # unsettled trades (sells in transit minus buys in transit) realigns cash to
+                # the same trade-date basis as the eval, removing the see-saw. Dividends are
+                # already reflected in usd_cash, so they are captured here too.
+                net_unsettled = unsettled_sell - unsettled_buy
+                total_asset_usd = total_eval + usd_cash + net_unsettled
+
                 summary = {
                     'total_eval_amount': total_eval,
                     'total_profit_amount': total_profit,
@@ -1706,12 +1758,19 @@ class USStockTrading:
                     'available_amount': usd_cash,  # USD cash available for trading
                     'usd_cash': usd_cash,
                     'exchange_rate': exchange_rate,
+                    'unsettled_buy_usd': unsettled_buy,
+                    'unsettled_sell_usd': unsettled_sell,
+                    'net_unsettled_usd': net_unsettled,
+                    # USD-denominated trade-date total assets (stock + USD cash + net unsettled).
+                    'total_asset_usd': total_asset_usd,
                 }
 
                 logger.info(f"Account Summary: Stock Eval ${summary['total_eval_amount']:.2f}, "
                            f"P/L ${summary['total_profit_amount']:+.2f} "
                            f"({summary['total_profit_rate']:+.2f}%), "
-                           f"USD Cash ${summary['usd_cash']:.2f}")
+                           f"USD Cash ${summary['usd_cash']:.2f}, "
+                           f"Net Unsettled ${net_unsettled:+.2f}, "
+                           f"Total Asset(USD) ${summary['total_asset_usd']:.2f}")
 
                 return summary
 
@@ -1721,6 +1780,209 @@ class USStockTrading:
         except Exception as e:
             logger.error(f"Error getting account summary: {str(e)}")
             return None
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Loop C prerequisites — overseas order amend/cancel + unfilled inquiry.
+    #
+    # Mirror the existing overseas order wrappers above (same _request/auth,
+    # OVRS_EXCG_CD handling, tr_id real-vs-paper switching, result-dict shape).
+    # NEW TRs — NOT exercised against live KIS at authoring time. See the
+    # TODO(live-validate) markers and tasks/loop_c_design_notes.md.
+    #
+    # TR ids confirmed against koreainvestment/open-trading-api (overseas):
+    #   - amend/cancel : real TTTT1004U / paper VTTT1004U (order-rvsecncl)
+    #   - unfilled (nccs): real TTTS3018R (paper VTTS3018R UNVERIFIED)
+    # ──────────────────────────────────────────────────────────────────────────
+    def amend_cancel_order(
+        self,
+        ticker: str,
+        orgn_odno: str,
+        rvse_cncl_dvsn_cd: str,
+        quantity: int,
+        exchange: str = None,
+        limit_price: float = 0.0,
+        dry_run: bool = False,
+    ) -> Dict[str, Any]:
+        """Amend (정정) or cancel (취소) an existing overseas order.
+
+        ``rvse_cncl_dvsn_cd``: "01" = amend (new ``limit_price``), "02" = cancel.
+        For cancel, KIS expects price 0.
+
+        ``dry_run``: when True (Loop C SHADOW verification), build the FULL request
+        exactly as it would be sent — tr_id + endpoint + full body, including the
+        ``# TODO(live-validate)`` fields (PDNO/ORD_SVR_DVSN_CD/OVRS_EXCG_CD/
+        OVRS_ORD_UNPR) — and RETURN it WITHOUT auth/hashkey/HTTP. Default False =
+        LIVE behaviour unchanged.
+
+        Returns: {success, order_no, ticker, quantity, message}. When ``dry_run``
+        is True instead returns {dry_run, tr_id, api_url, params}.
+        """
+        if not self.auto_trading and not dry_run:
+            return {
+                'success': False,
+                'order_no': None,
+                'ticker': ticker,
+                'quantity': quantity,
+                'message': 'Auto trading is disabled (AUTO_TRADING=False)'
+            }
+
+        if exchange is None:
+            exchange = self._resolve_exchange(ticker)
+        else:
+            exchange = EXCHANGE_CODES.get(exchange.upper(), exchange)
+
+        api_url = "/uapi/overseas-stock/v1/trading/order-rvsecncl"
+
+        if self.mode == "real":
+            tr_id = "TTTT1004U"  # Real overseas amend/cancel
+        else:
+            tr_id = "VTTT1004U"  # Demo overseas amend/cancel
+
+        action = "Amend" if rvse_cncl_dvsn_cd == "01" else "Cancel"
+        ord_unpr = f"{limit_price:.2f}" if rvse_cncl_dvsn_cd == "01" else "0"
+
+        # TODO(live-validate): TR field layout (PDNO requirement, ORD_SVR_DVSN_CD,
+        # whether OVRS_ORD_UNPR is mandatory on cancel) unverified against live KIS.
+        params = {
+            "CANO": self.trenv.my_acct,
+            "ACNT_PRDT_CD": self.trenv.my_prod,
+            "OVRS_EXCG_CD": exchange,
+            "PDNO": ticker.upper(),
+            "ORGN_ODNO": str(orgn_odno),
+            "RVSE_CNCL_DVSN_CD": rvse_cncl_dvsn_cd,  # 01: amend, 02: cancel
+            "ORD_QTY": str(int(quantity)),
+            "OVRS_ORD_UNPR": ord_unpr,
+            "ORD_SVR_DVSN_CD": "0",
+        }
+
+        if dry_run:
+            # Loop C SHADOW verification: return the exact request that WOULD be
+            # sent — tr_id + endpoint + full body (incl. the TODO(live-validate)
+            # fields above) — without auth/hashkey/HTTP.
+            return {
+                'dry_run': True,
+                'tr_id': tr_id,
+                'api_url': api_url,
+                'params': dict(params),
+            }
+
+        try:
+            res = self._request(api_url, tr_id, params, postFlag=True)
+
+            if res.isOK():
+                output = res.getBody().output
+                order_no = output.get('ODNO', '')
+                logger.info(
+                    f"[{ticker}] {action} order success: orgn={orgn_odno}, "
+                    f"new_no={order_no}, price={ord_unpr}"
+                )
+                return {
+                    'success': True,
+                    'order_no': order_no,
+                    'ticker': ticker,
+                    'quantity': quantity,
+                    'message': f'{action} order completed (orgn={orgn_odno})'
+                }
+            else:
+                error_msg = f"{res.getErrorCode()} - {res.getErrorMessage()}"
+                logger.error(f"[{ticker}] {action} order failed: {error_msg}")
+                return {
+                    'success': False,
+                    'order_no': None,
+                    'ticker': ticker,
+                    'quantity': quantity,
+                    'message': f'{action} order failed: {error_msg}'
+                }
+
+        except Exception as e:
+            logger.error(f"Error during {action.lower()} order: {str(e)}")
+            return {
+                'success': False,
+                'order_no': None,
+                'ticker': ticker,
+                'quantity': quantity,
+                'message': f'Error during {action.lower()} order: {str(e)}'
+            }
+
+    def amend_order(self, ticker: str, orgn_odno: str, limit_price: float,
+                    quantity: int, exchange: str = None,
+                    dry_run: bool = False) -> Dict[str, Any]:
+        """Convenience wrapper: amend (정정) an overseas order's limit price."""
+        return self.amend_cancel_order(
+            ticker=ticker, orgn_odno=orgn_odno, rvse_cncl_dvsn_cd="01",
+            quantity=quantity, exchange=exchange, limit_price=limit_price,
+            dry_run=dry_run,
+        )
+
+    def cancel_order(self, ticker: str, orgn_odno: str, quantity: int,
+                     exchange: str = None, dry_run: bool = False) -> Dict[str, Any]:
+        """Convenience wrapper: cancel (취소) an overseas order."""
+        return self.amend_cancel_order(
+            ticker=ticker, orgn_odno=orgn_odno, rvse_cncl_dvsn_cd="02",
+            quantity=quantity, exchange=exchange, limit_price=0.0,
+            dry_run=dry_run,
+        )
+
+    def get_unfilled_orders(self, ticker: str = None,
+                            exchange: str = "NASD") -> List[Dict[str, Any]]:
+        """Inquire overseas unfilled (미체결) orders via 미체결내역 (nccs).
+
+        TR: real TTTS3018R. ``exchange="NASD"`` queries the whole US day session.
+        Returns a normalised list, optionally filtered to ``ticker``. Returns []
+        on any failure (degrade to no-op — never treat empty as "all filled").
+
+        Each dict: {order_no, ticker, ord_qty, ccld_qty, nccs_qty, ord_unpr,
+                    sll_buy_dvsn_cd, exchange}.
+        """
+        api_url = "/uapi/overseas-stock/v1/trading/inquire-nccs"
+
+        # TODO(live-validate): paper tr_id VTTS3018R UNVERIFIED. Real TTTS3018R
+        # confirmed against the KIS overseas sample. Loop C runs SHADOW by default.
+        if self.mode == "real":
+            tr_id = "TTTS3018R"
+        else:
+            tr_id = "VTTS3018R"
+
+        params = {
+            "CANO": self.trenv.my_acct,
+            "ACNT_PRDT_CD": self.trenv.my_prod,
+            "OVRS_EXCG_CD": exchange,
+            "SORT_SQN": "DS",
+            "CTX_AREA_FK200": "",
+            "CTX_AREA_NK200": "",
+        }
+
+        out: List[Dict[str, Any]] = []
+        try:
+            res = self._request(api_url, tr_id, params)
+            if not res.isOK():
+                error_msg = f"{res.getErrorCode()} - {res.getErrorMessage()}"
+                logger.warning(f"Unfilled-order inquiry failed: {error_msg}")
+                return out
+
+            output = res.getBody().output
+            if not isinstance(output, list):
+                output = [output] if output else []
+
+            for row in output:
+                code = str(row.get('pdno', '') or '').strip().upper()
+                if ticker and code != ticker.upper():
+                    continue
+                out.append({
+                    'order_no': row.get('odno', ''),
+                    'ticker': code,
+                    'ord_qty': _safe_int(row.get('ft_ord_qty')),
+                    'ccld_qty': _safe_int(row.get('ft_ccld_qty')),
+                    'nccs_qty': _safe_int(row.get('nccs_qty')),  # unfilled remaining
+                    'ord_unpr': _safe_float(row.get('ft_ord_unpr3')),
+                    'sll_buy_dvsn_cd': row.get('sll_buy_dvsn_cd', ''),  # 01 sell / 02 buy
+                    'exchange': row.get('ovrs_excg_cd', exchange),
+                })
+            return out
+
+        except Exception as e:
+            logger.warning(f"Error during unfilled-order inquiry: {str(e)}")
+            return out
 
 
 class MultiAccountUSStockTrading:
@@ -1781,7 +2043,7 @@ class MultiAccountUSStockTrading:
 
     async def async_sell_stock(self, ticker: str, exchange: str = None,
                                timeout: float = 30.0, limit_price: Optional[float] = None,
-                               use_moo: bool = False) -> Dict[str, Any]:
+                               use_moo: bool = False, quantity: Optional[int] = None) -> Dict[str, Any]:
         if not self.account_configs:
             return self._aggregate_results(ticker, [], action="sell")
         results = []
@@ -1793,6 +2055,7 @@ class MultiAccountUSStockTrading:
                 timeout=timeout,
                 limit_price=limit_price,
                 use_moo=use_moo,
+                quantity=quantity,
             )
             result["account_name"] = account["name"]
             result["account_key"] = account["account_key"]

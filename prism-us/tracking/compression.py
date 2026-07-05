@@ -8,7 +8,7 @@ Based on compress_trading_memory.py but adapted for US market with market='US' f
 import json
 import logging
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 logger = logging.getLogger(__name__)
 
@@ -204,7 +204,7 @@ class USCompressionManager:
                                 "profit_rate": entry[3],
                                 "lessons": json.loads(entry[6]) if entry[6] else []
                             })
-                    except:
+                    except Exception:
                         pass
 
                 # Generate intuitions from patterns

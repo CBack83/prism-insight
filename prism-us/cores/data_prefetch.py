@@ -691,7 +691,7 @@ def _parse_10k_segment_revenue(html_content: str) -> str:
             vals = [_fmt_value(product_service.get((seg_type, p), 0)) for p in periods]
             result += f"| {seg_type}s | " + " | ".join(vals) + " |\n"
         total_vals = [_fmt_value(totals.get(p, 0)) for p in periods]
-        result += f"| **Total** | " + " | ".join(total_vals) + " |\n\n"
+        result += "| **Total** | " + " | ".join(total_vals) + " |\n\n"
 
     # Product lines
     if product_lines:
@@ -725,7 +725,7 @@ def _parse_10k_segment_revenue(html_content: str) -> str:
             vals = [_fmt_value(geographic.get((region, p), 0)) for p in periods]
             result += f"| {label} | " + " | ".join(vals) + " |\n"
         total_vals = [_fmt_value(totals.get(p, 0)) for p in periods]
-        result += f"| **Total** | " + " | ".join(total_vals) + " |\n\n"
+        result += "| **Total** | " + " | ".join(total_vals) + " |\n\n"
 
     # Country-level (skip if geographic segments already provide regional breakdown)
     if geo_country and not geographic:
@@ -878,6 +878,39 @@ def prefetch_us_analysis_data(ticker: str) -> dict:
     return result
 
 
+def _log_regime_snapshot(market: str, computed: dict) -> None:
+    """Append a regime snapshot to logs/regime_history.jsonl for distribution analysis.
+
+    사이클당 1회 기록 → 운영에서 regime 분포/휩쏘 관측용. 실패해도 무해(파이프라인 영향 0).
+    """
+    try:
+        if not computed:
+            return
+        import json as _json
+        import os as _os
+        from datetime import datetime as _dt
+        rec = {
+            "ts": _dt.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "market": market,
+            "regime": computed.get("market_regime"),
+            "confidence": computed.get("regime_confidence"),
+        }
+        s = computed.get("index_summary") or {}
+        for k in ("sp500_vs_50d_ma", "sp500_vs_200d_ma", "sp500_ma_50_200_cross",
+                  "sp500_4w_change_pct", "vix_level",
+                  "kospi_vs_60d_ma", "kospi_vs_120d_ma", "kospi_ma_60_120_cross",
+                  "kospi_2w_change_pct"):
+            if k in s:
+                rec[k] = s[k]
+        log_dir = _os.path.join(_os.getcwd(), "logs")
+        _os.makedirs(log_dir, exist_ok=True)
+        with open(_os.path.join(log_dir, "regime_history.jsonl"), "a") as f:
+            f.write(_json.dumps(rec, ensure_ascii=False) + "\n")
+        logger.info(f"[regime] {market}: {rec['regime']} (conf {rec['confidence']})")
+    except Exception as e:
+        logger.warning(f"[regime] snapshot log failed: {e}")
+
+
 def prefetch_us_macro_intelligence_data(reference_date: str = None) -> dict:
     """Prefetch data for US macro intelligence analysis.
 
@@ -905,7 +938,7 @@ def prefetch_us_macro_intelligence_data(reference_date: str = None) -> dict:
     # 1. S&P 500
     sp500_df = None
     try:
-        sp500_df = client.get_ohlcv("^GSPC", period="3mo", interval="1d")
+        sp500_df = client.get_ohlcv("^GSPC", period="1y", interval="1d")
         if sp500_df is not None and not sp500_df.empty:
             sp500_20d = sp500_df.tail(20)
             sp500_20d.columns = [col.title().replace("_", " ") for col in sp500_20d.columns]
@@ -917,7 +950,7 @@ def prefetch_us_macro_intelligence_data(reference_date: str = None) -> dict:
     # 2. NASDAQ
     nasdaq_df = None
     try:
-        nasdaq_df = client.get_ohlcv("^IXIC", period="3mo", interval="1d")
+        nasdaq_df = client.get_ohlcv("^IXIC", period="1y", interval="1d")
         if nasdaq_df is not None and not nasdaq_df.empty:
             nasdaq_20d = nasdaq_df.tail(20)
             nasdaq_20d.columns = [col.title().replace("_", " ") for col in nasdaq_20d.columns]
@@ -929,7 +962,7 @@ def prefetch_us_macro_intelligence_data(reference_date: str = None) -> dict:
     # 3. VIX
     vix_df = None
     try:
-        vix_df = client.get_ohlcv("^VIX", period="3mo", interval="1d")
+        vix_df = client.get_ohlcv("^VIX", period="1y", interval="1d")
         if vix_df is not None and not vix_df.empty:
             vix_20d = vix_df.tail(20)
             vix_20d.columns = [col.title().replace("_", " ") for col in vix_20d.columns]
@@ -941,11 +974,93 @@ def prefetch_us_macro_intelligence_data(reference_date: str = None) -> dict:
     # 4. Compute regime programmatically
     if sp500_df is not None and not sp500_df.empty:
         result["computed_regime"] = _compute_us_regime(sp500_df, nasdaq_df, vix_df)
+        _log_regime_snapshot("US", result["computed_regime"])
 
     if result:
         logger.info(f"Prefetched US macro intelligence data: {list(result.keys())}")
 
     return result
+
+
+# --- O'Neil Distribution Day (deterministic, 정보 주입 전용) ----------------
+# 설계 결정(tasks/distribution_day_design.md): 분산일은 결정론적으로 '계산'해 index_summary에
+# 정보로만 주입하고, regime의 기계적 강등은 하지 않는다. (강등은 매수+매도 양쪽을 뒤집어
+# US melt-up에서 조기청산 손실을 유발했고, 시장별 임계는 과최적화 위험이 컸다.) 분산일을
+# 어떻게 가중할지(신규매수 보수화 등)는 프롬프트에서 LLM이 판단한다 — O'Neil 본래의 재량적 용법.
+# 분산일 파라미터 (O'Neil/IBD). drop=-0.2% 종가, 거래량 전일 초과, 25거래일 윈도우, +5% 회복 만료.
+DISTRIBUTION_WINDOW = 25
+DISTRIBUTION_DROP_PCT = 0.2
+DISTRIBUTION_RECOVERY_PCT = 5.0
+
+
+def _count_distribution_days(df, close_col, volume_col=None,
+                             window: int = DISTRIBUTION_WINDOW,
+                             drop_threshold_pct: float = DISTRIBUTION_DROP_PCT,
+                             recovery_pct: float = DISTRIBUTION_RECOVERY_PCT):
+    """O'Neil 분산일 카운트 (결정론적).
+
+    분산일 = 지수가 전일 종가 대비 >= drop_threshold_pct% 하락 마감 AND 거래량이 전일 초과.
+    만료: (1) window 거래일 경과 시 윈도우 밖으로 자동 제외, (2) 분산일 이후 어떤 종가가
+    그 분산일 종가 대비 +recovery_pct% 이상 상승하면 카운트에서 제거.
+
+    Returns:
+        {"count": int, "window": int, "raw_count": int} 또는 거래량 불가 시 None.
+    """
+    try:
+        d = df.sort_index()
+        if volume_col is None:
+            for c in ["Volume", "거래량", "volume"]:
+                if c in d.columns:
+                    volume_col = c
+                    break
+        if volume_col is None or close_col not in d.columns:
+            return None
+        closes = d[close_col].astype(float).values
+        vols = d[volume_col].astype(float).values
+        n = len(closes)
+        if n < 2:
+            return None
+        import math as _math
+        valid_vol = [v for v in vols if not _math.isnan(v) and v > 0]
+        if not valid_vol:
+            return None
+        start = max(1, n - window)
+        raw = 0
+        kept = 0
+        running_max_after = -1.0
+        flags = []
+        for i in range(n - 1, start - 1, -1):
+            prev_c = closes[i - 1]
+            cur_c = closes[i]
+            if prev_c <= 0:
+                flags.append((i, False, running_max_after))
+                running_max_after = max(running_max_after, cur_c)
+                continue
+            pct = (cur_c - prev_c) / prev_c * 100.0
+            vol_up = vols[i] > vols[i - 1]
+            is_dist = (pct <= -drop_threshold_pct) and vol_up
+            flags.append((i, is_dist, running_max_after))
+            running_max_after = max(running_max_after, cur_c)
+        for (i, is_dist, max_after) in flags:
+            if not is_dist:
+                continue
+            raw += 1
+            if max_after >= closes[i] * (1 + recovery_pct / 100.0):
+                continue
+            kept += 1
+        return {"count": kept, "window": window, "raw_count": raw}
+    except Exception:
+        return None
+
+
+def _inject_distribution_days(index_summary, df, close_col) -> None:
+    """분산일 카운트를 결정론적으로 계산해 index_summary에 정보로 주입(강등 없음).
+
+    거래량 결측/불가 시 distribution_days=None. regime/confidence는 변경하지 않는다.
+    """
+    dist = _count_distribution_days(df, close_col)
+    index_summary["distribution_window"] = DISTRIBUTION_WINDOW
+    index_summary["distribution_days"] = None if dist is None else dist["count"]
 
 
 def _compute_us_regime(sp500_df: pd.DataFrame, nasdaq_df: pd.DataFrame = None, vix_df: pd.DataFrame = None) -> dict:
@@ -983,9 +1098,19 @@ def _compute_us_regime(sp500_df: pd.DataFrame, nasdaq_df: pd.DataFrame = None, v
         price_4w_ago = float(df_20d[close_col].iloc[0])
     change_4w_pct = ((current_price - price_4w_ago) / price_4w_ago) * 100
 
-    # MA position
+    # MA position (short-term, 20-day)
     ma_diff_pct = ((current_price - ma_20d) / ma_20d) * 100
     above_ma = current_price > ma_20d
+
+    # Trend MAs (50/200) from FULL history — needs ~1y fetch.
+    # O'Neil/Minervini trend template: 200MA = primary bull/bear divider, 50MA = intermediate.
+    closes_full = sp500_df[close_col].dropna()
+    ma_50 = float(closes_full.tail(50).mean()) if len(closes_full) >= 50 else None
+    ma_200 = float(closes_full.tail(200).mean()) if len(closes_full) >= 200 else None
+    above_50 = (current_price > ma_50) if ma_50 is not None else None
+    above_200 = (current_price > ma_200) if ma_200 is not None else None
+    # golden = 50MA above 200MA (bullish alignment); False = dead cross
+    golden = (ma_50 > ma_200) if (ma_50 is not None and ma_200 is not None) else None
 
     # VIX level
     vix_current = None
@@ -1045,22 +1170,51 @@ def _compute_us_regime(sp500_df: pd.DataFrame, nasdaq_df: pd.DataFrame = None, v
         except Exception:
             pass
 
-    # Market regime classification (US uses 4-week / ±3%/±5% thresholds + VIX)
-    if above_ma and change_4w_pct > 3 and vix_level in ("low", "moderate"):
-        regime = "strong_bull"
-        confidence = 0.85
-    elif above_ma and change_4w_pct >= 0:
-        regime = "moderate_bull"
-        confidence = 0.75
-    elif abs(ma_diff_pct) <= 1 and abs(change_4w_pct) < 2:
-        regime = "sideways"
-        confidence = 0.65
-    elif not above_ma and change_4w_pct < -5 and vix_level in ("elevated", "high"):
-        regime = "strong_bear"
-        confidence = 0.85
+    # Market regime classification.
+    # Trend-template (200MA primary divider) when 200MA available; else legacy 20MA logic.
+    # Output strings unchanged (6 regimes) so downstream buy-matrix/prompts stay compatible.
+    if ma_200 is not None:
+        if above_200:
+            # Primary uptrend (price above 200MA)
+            if above_50 and golden and change_4w_pct > 3 and vix_level in ("low", "moderate"):
+                regime = "strong_bull"
+                confidence = 0.90
+            elif above_50 or change_4w_pct >= 0:
+                regime = "moderate_bull"
+                confidence = 0.78
+            else:
+                # above primary trend but short-term pullback below 50MA
+                regime = "sideways"
+                confidence = 0.62
+        else:
+            # Primary downtrend (price below 200MA) → never 'bull'. Bear-rally protection:
+            # a sharp 4w bounce here is classified cautious (sideways), not strong_bull.
+            if golden is False and change_4w_pct < -5 and vix_level in ("elevated", "high"):
+                regime = "strong_bear"
+                confidence = 0.90
+            elif change_4w_pct < 0:
+                regime = "moderate_bear"
+                confidence = 0.78
+            else:
+                regime = "sideways"
+                confidence = 0.55
     else:
-        regime = "moderate_bear"
-        confidence = 0.75
+        # Legacy 20MA logic (insufficient history for 200MA) — backward compatible
+        if above_ma and change_4w_pct > 3 and vix_level in ("low", "moderate"):
+            regime = "strong_bull"
+            confidence = 0.85
+        elif above_ma and change_4w_pct >= 0:
+            regime = "moderate_bull"
+            confidence = 0.75
+        elif abs(ma_diff_pct) <= 1 and abs(change_4w_pct) < 2:
+            regime = "sideways"
+            confidence = 0.65
+        elif not above_ma and change_4w_pct < -5 and vix_level in ("elevated", "high"):
+            regime = "strong_bear"
+            confidence = 0.85
+        else:
+            regime = "moderate_bear"
+            confidence = 0.75
 
     index_summary = {
         "sp500_20d_trend": sp500_trend,
@@ -1070,9 +1224,21 @@ def _compute_us_regime(sp500_df: pd.DataFrame, nasdaq_df: pd.DataFrame = None, v
         "sp500_20d_ma": round(ma_20d, 2),
         "nasdaq_20d_trend": nasdaq_trend,
     }
+    # Trend MA fields (additive — present only when enough history)
+    if ma_50 is not None:
+        index_summary["sp500_50d_ma"] = round(ma_50, 2)
+        index_summary["sp500_vs_50d_ma"] = "above" if above_50 else "below"
+    if ma_200 is not None:
+        index_summary["sp500_200d_ma"] = round(ma_200, 2)
+        index_summary["sp500_vs_200d_ma"] = "above" if above_200 else "below"
+    if golden is not None:
+        index_summary["sp500_ma_50_200_cross"] = "golden" if golden else "dead"
     if vix_current is not None:
         index_summary["vix_current"] = round(vix_current, 2)
         index_summary["vix_level"] = vix_level
+
+    # O'Neil 분산일 결정론 카운트를 index_summary에 정보로 주입(강등 없음 — LLM이 프롬프트에서 판단)
+    _inject_distribution_days(index_summary, sp500_df, close_col)
 
     return {
         "market_regime": regime,

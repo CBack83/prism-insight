@@ -12,6 +12,7 @@ import math
 import time
 from pathlib import Path
 from typing import Optional, Dict, List, Any
+from zoneinfo import ZoneInfo
 
 import yaml
 
@@ -33,10 +34,70 @@ from kis_auth import (
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+KST = ZoneInfo("Asia/Seoul")
+
+
+def _now_kst() -> datetime.datetime:
+    """Return timezone-aware current time in Korea Standard Time."""
+    return datetime.datetime.now(KST)
+
+
+def _domestic_order_window(now: Optional[datetime.datetime] = None) -> str:
+    """Classify the Korean domestic stock order window using KST.
+
+    Returns one of:
+    - regular: 09:00~15:30 market orders
+    - closing: 15:40~16:00 after-hours closing-price orders
+    - reserved: KIS reserved-order window, excluding 23:40~00:10
+    - unavailable: gaps where neither regular/closing nor reserved orders are accepted
+    """
+    now = now or _now_kst()
+    current_time = now.astimezone(KST).time() if now.tzinfo else now.time()
+
+    if datetime.time(9, 0) <= current_time <= datetime.time(15, 30):
+        return "regular"
+    if datetime.time(15, 40) <= current_time <= datetime.time(16, 0):
+        return "closing"
+    if datetime.time(16, 0) < current_time <= datetime.time(23, 40):
+        return "reserved"
+    if datetime.time(0, 10) <= current_time <= datetime.time(7, 30):
+        return "reserved"
+    return "unavailable"
+
 # Load configuration file
 CONFIG_FILE = TRADING_DIR / "config" / "kis_devlp.yaml"
 with open(CONFIG_FILE, encoding="UTF-8") as f:
     _cfg = yaml.safe_load(f)
+
+
+def _resolve_sell_quantity(holding_quantity: int, quantity: int = None) -> int:
+    """Resolve the number of shares to sell.
+
+    When ``quantity`` is None the full holding is sold (unchanged behavior).
+    When given, the requested partial quantity is used, clamped to the range
+    [1, holding_quantity] to avoid over-selling. Used by pyramiding fractional
+    sells (#288).
+    """
+    if quantity is None:
+        return holding_quantity
+    try:
+        q = int(quantity)
+    except (TypeError, ValueError):
+        return holding_quantity
+    if q <= 0:
+        return holding_quantity
+    return min(q, holding_quantity)
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    """Coerce a KIS response field (often an empty string) to int. Never raises."""
+    try:
+        s = str(value).strip()
+        if not s:
+            return default
+        return int(float(s))
+    except (TypeError, ValueError):
+        return default
 
 
 class DomesticStockTrading:
@@ -165,7 +226,7 @@ class DomesticStockTrading:
         self._semaphore = asyncio.Semaphore(3)  # Maximum 3 concurrent requests
         self._stock_locks = {}  # Per-stock locks
 
-        logger.info(f"✅ DomesticStockTrading initialized (Async Enabled)")
+        logger.info("✅ DomesticStockTrading initialized (Async Enabled)")
         logger.info(f"   Mode: {mode}, Buy Amount: {self.buy_amount:,} KRW")
         logger.info(f"   Account: {self.account_name} ({ka.mask_account_number(self.trenv.my_acct)}-{self.trenv.my_prod})")
 
@@ -218,7 +279,11 @@ class DomesticStockTrading:
                     'stock_name': data.get('rprs_mrkt_kor_name', ''),
                     'current_price': int(data.get('stck_prpr', 0)),  # Current price
                     'change_rate': float(data.get('prdy_ctrt', 0)),  # Change rate from previous day
-                    'volume': int(data.get('acml_vol', 0))  # Cumulative volume
+                    'volume': int(data.get('acml_vol', 0)),  # Cumulative volume
+                    # 종목상태/시장경고 (이벤트 강제청산 자동탐지용 — cores.corporate_status)
+                    # iscd_stat_cls_code: 00/55 정상, 51 관리종목, 52 투자위험, 53 투자경고, 58 거래정지
+                    'iscd_stat_cls_code': data.get('iscd_stat_cls_code', ''),
+                    'mrkt_warn_cls_code': data.get('mrkt_warn_cls_code', ''),  # 00 없음/01 주의/02 경고/03 위험
                 }
 
                 logger.info(f"[{stock_code}] Current price: {result['current_price']:,} KRW ({result['change_rate']:+.2f}%)")
@@ -250,6 +315,14 @@ class DomesticStockTrading:
             return 0
 
         current_price = current_price_info['current_price']
+
+        # Defensive guard: reject when the current price is missing/zero (e.g. a
+        # failed quote, or a non-KR ticker mis-routed to this domestic path).
+        # Without this, `amount / current_price` raises ZeroDivisionError and we
+        # must NEVER attempt to buy at an unknown price.
+        if not current_price or current_price <= 0:
+            logger.warning(f"[{stock_code}] Invalid current price ({current_price}) - rejecting buy")
+            return 0
 
         # Calculate buyable quantity (floor division)
         current_quantity = math.floor(amount / current_price)
@@ -411,6 +484,19 @@ class DomesticStockTrading:
 
         amount = buy_amount if buy_amount else self.buy_amount
 
+        # Defensive guard: a missing/zero limit price would raise
+        # ZeroDivisionError, and we must never buy at an unknown price.
+        if not limit_price or limit_price <= 0:
+            logger.warning(f"[{stock_code}] Invalid limit price ({limit_price}) - rejecting buy")
+            return {
+                'success': False,
+                'order_no': None,
+                'stock_code': stock_code,
+                'quantity': 0,
+                'limit_price': limit_price,
+                'message': f'Invalid limit price ({limit_price}). Cannot execute buy order.'
+            }
+
         # Calculate buyable quantity (based on limit price)
         buy_quantity = math.floor(amount / limit_price)
 
@@ -511,27 +597,34 @@ class DomesticStockTrading:
                 'message': 'Auto trading is disabled. Cannot execute buy order. (AUTO_TRADING=False)'
             }
 
-        now = datetime.datetime.now()
-        current_time = now.time()
+        now = _now_kst()
+        order_window = _domestic_order_window(now)
 
-        # Branch by time period
-        if datetime.time(9, 0) <= current_time <= datetime.time(15, 30):
-            # Regular trading hours
-            logger.info(f"[{stock_code}] Regular trading hours - executing market buy")
+        # Branch by Korean market time (KST), regardless of server/local timezone.
+        if order_window == "regular":
+            logger.info(f"[{stock_code}] Regular trading hours (KST) - executing market buy")
             return self.buy_market_price(stock_code, buy_amount)
 
-        elif datetime.time(15, 40) <= current_time <= datetime.time(16, 0):
-            # After-hours closing price trading
-            logger.info(f"[{stock_code}] After-hours closing price time - executing closing price buy")
+        if order_window == "closing":
+            logger.info(f"[{stock_code}] After-hours closing price time (KST) - executing closing price buy")
             return self.buy_closing_price(stock_code, buy_amount)
 
-        else:
-            # Reserved order (limit or market price)
+        if order_window == "reserved":
             if limit_price:
-                logger.info(f"[{stock_code}] Outside trading hours - executing reserved order (limit: {limit_price:,} KRW)")
+                logger.info(f"[{stock_code}] Reserved order window (KST) - executing reserved order (limit: {limit_price:,} KRW)")
             else:
-                logger.info(f"[{stock_code}] Outside trading hours - executing reserved order (market)")
+                logger.info(f"[{stock_code}] Reserved order window (KST) - executing reserved order (market)")
             return self.buy_reserved_order(stock_code, buy_amount, limit_price=limit_price)
+
+        message = "Order window unavailable in KST (reserved orders are accepted 16:00~23:40 and 00:10~07:30)"
+        logger.warning(f"[{stock_code}] {message}")
+        return {
+            'success': False,
+            'order_no': None,
+            'stock_code': stock_code,
+            'quantity': 0,
+            'message': message
+        }
 
     def buy_closing_price(self, stock_code: str, buy_amount: int = None) -> Dict[str, Any]:
         """
@@ -745,12 +838,15 @@ class DomesticStockTrading:
                 'message': f"Error during reserved buy order: {str(e)}"
             }
 
-    def sell_all_market_price(self, stock_code: str) -> Dict[str, Any]:
+    def sell_all_market_price(self, stock_code: str, quantity: int = None) -> Dict[str, Any]:
         """
-        Sell all at market price (liquidate entire holding)
+        Sell at market price.
 
         Args:
             stock_code: Stock code
+            quantity: Partial sell quantity. When None, sells the entire holding
+                (unchanged behavior). When given, sells exactly that many shares
+                (clamped to the current holding).
 
         Returns:
             {
@@ -772,9 +868,9 @@ class DomesticStockTrading:
             }
 
         # Check holding quantity
-        buy_quantity = self.get_holding_quantity(stock_code)
+        holding_quantity = self.get_holding_quantity(stock_code)
 
-        if buy_quantity == 0:
+        if holding_quantity == 0:
             return {
                 'success': False,
                 'order_no': None,
@@ -782,6 +878,9 @@ class DomesticStockTrading:
                 'quantity': 0,
                 'message': 'No holding quantity'
             }
+
+        # Determine sell quantity (partial when quantity given, else full holding)
+        buy_quantity = _resolve_sell_quantity(holding_quantity, quantity)
 
         # Execute sell order
         api_url = "/uapi/domestic-stock/v1/trading/order-cash"
@@ -842,9 +941,9 @@ class DomesticStockTrading:
                 'message': f'Error during sell order: {str(e)}'
             }
 
-    def smart_sell_all(self, stock_code: str, limit_price: int = None) -> Dict[str, Any]:
+    def smart_sell_all(self, stock_code: str, limit_price: int = None, quantity: int = None) -> Dict[str, Any]:
         """
-        Automatically sell all using the optimal method based on time (excluding after-hours single price trading due to high unfilled probability)
+        Automatically sell using the optimal method based on time (excluding after-hours single price trading due to high unfilled probability)
 
         - 09:00~15:30: Market price sell
         - 15:40~16:00: After-hours closing price trading
@@ -853,6 +952,7 @@ class DomesticStockTrading:
         Args:
             stock_code: Stock code
             limit_price: Limit price for reserved order (market order if None)
+            quantity: Partial sell quantity (None = full holding, unchanged behavior)
 
         Returns:
             Sell result
@@ -867,32 +967,43 @@ class DomesticStockTrading:
                 'message': 'Auto trading is disabled. Cannot execute sell order. (AUTO_TRADING=False)'
             }
 
-        now = datetime.datetime.now()
-        current_time = now.time()
+        now = _now_kst()
+        order_window = _domestic_order_window(now)
 
-        # Branch by time period
-        if datetime.time(9, 0) <= current_time <= datetime.time(15, 30):
-            # Regular trading hours - market sell
-            logger.info(f"[{stock_code}] Regular trading hours - executing market sell")
-            return self.sell_all_market_price(stock_code)
+        # Branch by Korean market time (KST), regardless of server/local timezone.
+        if order_window == "regular":
+            logger.info(f"[{stock_code}] Regular trading hours (KST) - executing market sell")
+            return self.sell_all_market_price(stock_code, quantity=quantity)
 
-        elif datetime.time(15, 40) <= current_time <= datetime.time(16, 0):
-            # After-hours closing price trading
-            logger.info(f"[{stock_code}] After-hours closing price time - executing closing price sell")
-            return self.sell_all_closing_price(stock_code)
+        if order_window == "closing":
+            logger.info(f"[{stock_code}] After-hours closing price time (KST) - executing closing price sell")
+            return self.sell_all_closing_price(stock_code, quantity=quantity)
 
-        else:
-            # Reserved order (limit or market price)
+        if order_window == "reserved":
             if limit_price:
-                logger.info(f"[{stock_code}] Outside trading hours - executing reserved order (limit: {limit_price:,} KRW)")
+                logger.info(f"[{stock_code}] Reserved order window (KST) - executing reserved order (limit: {limit_price:,} KRW)")
             else:
-                logger.info(f"[{stock_code}] Outside trading hours - executing reserved order (market)")
-            return self.sell_all_reserved_order(stock_code, limit_price=limit_price)
+                logger.info(f"[{stock_code}] Reserved order window (KST) - executing reserved order (market)")
+            return self.sell_all_reserved_order(stock_code, limit_price=limit_price, quantity=quantity)
 
-    def sell_all_closing_price(self, stock_code: str) -> Dict[str, Any]:
+        message = "Order window unavailable in KST (reserved orders are accepted 16:00~23:40 and 00:10~07:30)"
+        logger.warning(f"[{stock_code}] {message}")
+        return {
+            'success': False,
+            'order_no': None,
+            'stock_code': stock_code,
+            'quantity': 0,
+            'message': message
+        }
+
+    def sell_all_closing_price(self, stock_code: str, quantity: int = None) -> Dict[str, Any]:
         """
-        Sell all at after-hours closing price (15:40~16:00)
+        Sell at after-hours closing price (15:40~16:00)
         Sell at closing price of the day
+
+        Args:
+            stock_code: Stock code
+            quantity: Partial sell quantity (None = full holding, unchanged)
         """
         if not self.auto_trading:
             return {
@@ -904,9 +1015,9 @@ class DomesticStockTrading:
             }
 
         # Check holding quantity
-        buy_quantity = self.get_holding_quantity(stock_code)
+        holding_quantity = self.get_holding_quantity(stock_code)
 
-        if buy_quantity == 0:
+        if holding_quantity == 0:
             return {
                 'success': False,
                 'order_no': None,
@@ -914,6 +1025,8 @@ class DomesticStockTrading:
                 'quantity': 0,
                 'message': 'No holding quantity'
             }
+
+        buy_quantity = _resolve_sell_quantity(holding_quantity, quantity)
 
         # After-hours closing price sell
         api_url = "/uapi/domestic-stock/v1/trading/order-cash"
@@ -970,15 +1083,16 @@ class DomesticStockTrading:
                 'message': f'Error during sell: {str(e)}'
             }
 
-    def sell_all_reserved_order(self, stock_code: str, end_date: str = None, limit_price: int = None) -> Dict[str, Any]:
+    def sell_all_reserved_order(self, stock_code: str, end_date: str = None, limit_price: int = None, quantity: int = None) -> Dict[str, Any]:
         """
-        Sell all with reserved order (auto-execute on next trading day)
+        Sell with reserved order (auto-execute on next trading day)
         Reserved order available: 15:40~next business day 07:30 (excluding 23:40~00:10)
 
         Args:
             stock_code: Stock code
             end_date: Period reservation end date (YYYYMMDD format, regular reservation if None)
             limit_price: Limit price (market order if None)
+            quantity: Partial sell quantity (None = full holding, unchanged)
 
         Returns:
             Sell result
@@ -994,8 +1108,8 @@ class DomesticStockTrading:
             }
 
         # Check holding quantity
-        buy_quantity = self.get_holding_quantity(stock_code)
-        if buy_quantity == 0:
+        holding_quantity = self.get_holding_quantity(stock_code)
+        if holding_quantity == 0:
             return {
                 'success': False,
                 'order_no': None,
@@ -1003,6 +1117,8 @@ class DomesticStockTrading:
                 'quantity': 0,
                 'message': 'No holding quantity'
             }
+
+        buy_quantity = _resolve_sell_quantity(holding_quantity, quantity)
 
         # Set order type and unit price
         if limit_price and limit_price > 0:
@@ -1128,7 +1244,7 @@ class DomesticStockTrading:
                 'total_amount': 0,
                 'order_no': None,
                 'message': f'Buy request timeout ({timeout}s)',
-                'timestamp': datetime.datetime.now().isoformat()
+                'timestamp': _now_kst().isoformat()
             }
 
     async def _execute_buy_stock(self, stock_code: str, buy_amount: int = None, limit_price: int = None) -> Dict[str, Any]:
@@ -1143,7 +1259,7 @@ class DomesticStockTrading:
             'total_amount': 0,
             'order_no': None,
             'message': '',
-            'timestamp': datetime.datetime.now().isoformat()
+            'timestamp': _now_kst().isoformat()
         }
 
         # 3-level protection: per-stock lock + semaphore + global lock
@@ -1214,15 +1330,16 @@ class DomesticStockTrading:
 
         return result
 
-    async def async_sell_stock(self, stock_code: str, timeout: float = 30.0, limit_price: Optional[int] = None) -> Dict[str, Any]:
+    async def async_sell_stock(self, stock_code: str, timeout: float = 30.0, limit_price: Optional[int] = None, quantity: Optional[int] = None) -> Dict[str, Any]:
         """
         Async sell API (with timeout)
-        Sell all holding quantity at market price
+        Sell holding quantity (full by default, partial when quantity given)
 
         Args:
             stock_code: Stock code (6 digits)
             timeout: Timeout in seconds
             limit_price: Limit price for reserved order (market order if None)
+            quantity: Partial sell quantity (None = full holding, unchanged behavior)
 
         Returns:
             {
@@ -1238,7 +1355,7 @@ class DomesticStockTrading:
         """
         try:
             return await asyncio.wait_for(
-                self._execute_sell_stock(stock_code, limit_price),
+                self._execute_sell_stock(stock_code, limit_price, quantity=quantity),
                 timeout=timeout
             )
         except asyncio.TimeoutError:
@@ -1250,11 +1367,14 @@ class DomesticStockTrading:
                 'estimated_amount': 0,
                 'order_no': None,
                 'message': f'Sell request timeout ({timeout}s)',
-                'timestamp': datetime.datetime.now().isoformat()
+                'timestamp': _now_kst().isoformat()
             }
 
-    async def _execute_sell_stock(self, stock_code: str, limit_price: int = None) -> Dict[str, Any]:
-        """Actual sell execution logic (includes portfolio verification defensive logic)"""
+    async def _execute_sell_stock(self, stock_code: str, limit_price: int = None, quantity: int = None) -> Dict[str, Any]:
+        """Actual sell execution logic (includes portfolio verification defensive logic)
+
+        quantity: partial sell quantity (None = full holding, unchanged behavior)
+        """
         result = {
             'success': False,
             'stock_code': stock_code,
@@ -1263,7 +1383,7 @@ class DomesticStockTrading:
             'estimated_amount': 0,
             'order_no': None,
             'message': '',
-            'timestamp': datetime.datetime.now().isoformat()
+            'timestamp': _now_kst().isoformat()
         }
 
         # 3-level protection: per-stock lock + semaphore + global lock
@@ -1307,10 +1427,37 @@ class DomesticStockTrading:
                             result['current_price'] = current_price_info['current_price']
                             logger.info(f"[Async Sell API] {stock_code} current price: {current_price_info['current_price']:,} KRW")
 
-                        # Defensive logic 2: Check holding quantity once more before selling
-                        holding_quantity = await asyncio.to_thread(
-                            self.get_holding_quantity, stock_code
-                        )
+                        # Defensive logic 2: Re-confirm holding quantity once more before selling.
+                        # ⚠️ get_portfolio() returns [] on a transient balance-inquiry failure, so a
+                        # single re-check could read a FALSE 0 and abort a legitimate sell (sim already
+                        # deleted the row -> sim/real divergence). Distinguish "empty portfolio (likely
+                        # API failure)" from "ticker genuinely absent (sold)": retry on empty, and only
+                        # then fall back to the quantity confirmed by the FIRST portfolio read above.
+                        prev_confirmed_qty = int(target_stock.get('quantity', 0) or 0)
+                        holding_quantity = 0
+                        for _chk_attempt in range(3):
+                            portfolio_recheck = await asyncio.to_thread(self.get_portfolio)
+                            if portfolio_recheck:  # non-empty -> trustworthy snapshot
+                                _match = next(
+                                    (s for s in portfolio_recheck if s.get('stock_code') == stock_code),
+                                    None
+                                )
+                                holding_quantity = int(_match['quantity']) if _match else 0
+                                break
+                            # empty list -> almost certainly a transient API failure, NOT a real 0
+                            logger.warning(
+                                f"[Async Sell API] {stock_code} portfolio empty on final check "
+                                f"(attempt {_chk_attempt + 1}/3) — retrying"
+                            )
+                            await asyncio.sleep(1.0)
+                        else:
+                            # all retries returned empty -> treat as API failure, not 0 holdings;
+                            # fall back to the first-confirmed quantity so a valid sell is not dropped.
+                            holding_quantity = prev_confirmed_qty
+                            logger.warning(
+                                f"[Async Sell API] {stock_code} final check kept returning empty portfolio "
+                                f"— falling back to first-confirmed qty {prev_confirmed_qty}"
+                            )
 
                         if holding_quantity <= 0:
                             result['message'] = f'{stock_code} holding quantity is 0 at final check'
@@ -1322,12 +1469,15 @@ class DomesticStockTrading:
                         # CRITICAL: Convert to int - KIS API requires integer strings, not float strings
                         effective_limit_price = int(limit_price) if (limit_price and limit_price > 0) else (int(result['current_price']) if result['current_price'] > 0 else None)
 
+                        # Resolve partial sell quantity (None = full holding)
+                        sell_quantity = _resolve_sell_quantity(holding_quantity, quantity)
+
                         if effective_limit_price:
-                            logger.info(f"[Async Sell API] {stock_code} executing sell all (holding: {holding_quantity} shares, limit: {effective_limit_price:,} KRW)")
+                            logger.info(f"[Async Sell API] {stock_code} executing sell (qty: {sell_quantity}/{holding_quantity} shares, limit: {effective_limit_price:,} KRW)")
                         else:
-                            logger.info(f"[Async Sell API] {stock_code} executing sell all (holding: {holding_quantity} shares, market)")
+                            logger.info(f"[Async Sell API] {stock_code} executing sell (qty: {sell_quantity}/{holding_quantity} shares, market)")
                         all_sell_result = await asyncio.to_thread(
-                            self.smart_sell_all, stock_code, effective_limit_price
+                            self.smart_sell_all, stock_code, effective_limit_price, sell_quantity
                         )
 
                         if all_sell_result['success']:
@@ -1362,6 +1512,35 @@ class DomesticStockTrading:
                     await asyncio.sleep(0.1)
 
         return result
+
+    def _request_with_retry(self, api_url: str, tr_id: str, params: Dict[str, Any], attempts: int = 3):
+        """
+        Retry wrapper for read-only inquiries.
+
+        Transient gateway errors (e.g. EGW00215 "초당 거래건수 초과" per-second
+        rate limit) must not surface as a normal failure: callers such as
+        get_holding_quantity() interpret an empty portfolio as "no holdings"
+        and abort sell orders. The per-second quota resets quickly, so a short
+        backoff retry recovers. Returns the last response (caller checks isOK()).
+        """
+        res = None
+        for attempt in range(attempts):
+            if attempt:
+                time.sleep(attempt)  # 1s, 2s — per-second quota resets each second
+            try:
+                res = self._request(api_url, tr_id, params)
+            except Exception as e:
+                if attempt == attempts - 1:
+                    raise
+                logger.warning(f"Inquiry error, retrying ({attempt + 1}/{attempts}): {e}")
+                continue
+            if res.isOK():
+                return res
+            logger.warning(
+                f"Inquiry failed, retrying ({attempt + 1}/{attempts}): "
+                f"{res.getErrorCode()} - {res.getErrorMessage()}"
+            )
+        return res
 
     def get_portfolio(self) -> List[Dict[str, Any]]:
         """
@@ -1402,7 +1581,7 @@ class DomesticStockTrading:
         }
 
         try:
-            res = self._request(api_url, tr_id, params)
+            res = self._request_with_retry(api_url, tr_id, params)
 
             if res.isOK():
                 current_portfolio = []
@@ -1521,6 +1700,227 @@ class DomesticStockTrading:
             logger.error(f"Error during account summary inquiry: {str(e)}")
             return {}
 
+    # ──────────────────────────────────────────────────────────────────────────
+    # Loop C prerequisites — order amend/cancel + unfilled inquiry TR wrappers.
+    #
+    # These mirror the existing order-cash wrappers above (same _request/auth/
+    # tr_id real-vs-paper switching, same result-dict shape). They are NEW TRs
+    # and were NOT exercised against live KIS at authoring time — see the
+    # TODO(live-validate) markers and tasks/loop_c_design_notes.md.
+    #
+    # TR ids confirmed against koreainvestment/open-trading-api (2025-06-01):
+    #   - amend/cancel : real TTTC0013U / paper VTTC0013U  (order-rvsecncl)
+    #     ⚠️ NOT the legacy TTTC0803U/VTTC0803U.
+    #   - revisable inquiry : real TTTC0084R (paper VTTC0084R UNVERIFIED)
+    # ──────────────────────────────────────────────────────────────────────────
+    def amend_cancel_order(
+        self,
+        stock_code: str,
+        orgn_odno: str,
+        rvse_cncl_dvsn_cd: str,
+        krx_fwdg_ord_orgno: str = "",
+        ord_dvsn: str = "00",
+        quantity: int = 0,
+        limit_price: int = 0,
+        qty_all_ord_yn: str = "Y",
+        excg_id_dvsn_cd: str = "KRX",
+        dry_run: bool = False,
+    ) -> Dict[str, Any]:
+        """Amend (정정) or cancel (취소) an existing domestic order.
+
+        KIS uses ONE TR for both, distinguished by ``rvse_cncl_dvsn_cd``:
+          - "01" = 정정 (amend): supply the NEW ``limit_price`` (and ``quantity``
+            if amending a partial qty).
+          - "02" = 취소 (cancel): price is ignored by KIS; pass 0.
+
+        Args:
+            stock_code: 6-digit code (informational; KIS keys off orgn_odno).
+            orgn_odno: Original order number (ORGN_ODNO) being amended/cancelled.
+            rvse_cncl_dvsn_cd: "01" amend, "02" cancel.
+            krx_fwdg_ord_orgno: Original KRX forwarding order org no
+                (KRX_FWDG_ORD_ORGNO) returned when the original order was placed.
+            ord_dvsn: Order division of the ORIGINAL order ("00" limit, etc).
+            quantity: Quantity to amend/cancel. Ignored when qty_all_ord_yn="Y".
+            limit_price: New limit price for an amend; 0 for cancel.
+            qty_all_ord_yn: "Y" = whole remaining qty, "N" = partial (uses quantity).
+            excg_id_dvsn_cd: Exchange id division ("KRX"/"NXT"/"SOR").
+            dry_run: When True (Loop C SHADOW verification), build the FULL request
+                exactly as it would be sent and RETURN it WITHOUT any auth/hashkey/
+                HTTP — no network, no order. Default False = LIVE behaviour
+                unchanged.
+
+        Returns:
+            Result dict: {success, order_no, stock_code, message}. When
+            ``dry_run`` is True instead returns {dry_run, tr_id, api_url, params}.
+        """
+        if not self.auto_trading and not dry_run:
+            return {
+                'success': False,
+                'order_no': None,
+                'stock_code': stock_code,
+                'message': 'Auto trading is disabled. Cannot amend/cancel order. (AUTO_TRADING=False)'
+            }
+
+        api_url = "/uapi/domestic-stock/v1/trading/order-rvsecncl"
+
+        # Real vs paper switching, exactly like order-cash above.
+        if self.mode == "real":
+            tr_id = "TTTC0013U"  # Real amend/cancel (NOT legacy TTTC0803U)
+        else:
+            tr_id = "VTTC0013U"  # Demo amend/cancel
+
+        action = "Amend" if rvse_cncl_dvsn_cd == "01" else "Cancel"
+
+        # TODO(live-validate): TR field layout (esp. EXCG_ID_DVSN_CD requirement,
+        # ORD_UNPR semantics on cancel) unverified against live KIS. Confirmed
+        # only against the KIS GitHub sample, not a live order.
+        params = {
+            "CANO": self.trenv.my_acct,
+            "ACNT_PRDT_CD": self.trenv.my_prod,
+            "KRX_FWDG_ORD_ORGNO": krx_fwdg_ord_orgno,
+            "ORGN_ODNO": str(orgn_odno),
+            "ORD_DVSN": ord_dvsn,
+            "RVSE_CNCL_DVSN_CD": rvse_cncl_dvsn_cd,  # 01: amend, 02: cancel
+            "ORD_QTY": str(int(quantity)),
+            "ORD_UNPR": str(int(limit_price)),
+            "QTY_ALL_ORD_YN": qty_all_ord_yn,
+            "EXCG_ID_DVSN_CD": excg_id_dvsn_cd,
+            "CNDT_PRIC": "",
+        }
+
+        if dry_run:
+            # Loop C SHADOW verification: return the exact request that WOULD be
+            # sent — tr_id + endpoint + full body — without auth/hashkey/HTTP.
+            return {
+                'dry_run': True,
+                'tr_id': tr_id,
+                'api_url': api_url,
+                'params': dict(params),
+            }
+
+        try:
+            res = self._request(api_url, tr_id, params, postFlag=True)
+
+            if res.isOK():
+                output = res.getBody().output
+                order_no = output.get('odno', '')
+                logger.info(
+                    f"[{stock_code}] {action} order success: orgn={orgn_odno}, "
+                    f"new_no={order_no}, price={limit_price}"
+                )
+                return {
+                    'success': True,
+                    'order_no': order_no,
+                    'stock_code': stock_code,
+                    'message': f'{action} order completed (orgn={orgn_odno})'
+                }
+            else:
+                error_msg = f"{res.getErrorCode()} - {res.getErrorMessage()}"
+                logger.error(f"[{stock_code}] {action} order failed: {error_msg}")
+                return {
+                    'success': False,
+                    'order_no': None,
+                    'stock_code': stock_code,
+                    'message': f'{action} order failed: {error_msg}'
+                }
+
+        except Exception as e:
+            logger.error(f"Error during {action.lower()} order: {str(e)}")
+            return {
+                'success': False,
+                'order_no': None,
+                'stock_code': stock_code,
+                'message': f'Error during {action.lower()} order: {str(e)}'
+            }
+
+    def amend_order(self, stock_code: str, orgn_odno: str, limit_price: int,
+                    krx_fwdg_ord_orgno: str = "", ord_dvsn: str = "00",
+                    quantity: int = 0, qty_all_ord_yn: str = "Y",
+                    dry_run: bool = False) -> Dict[str, Any]:
+        """Convenience wrapper: amend (정정) an order's limit price to ``limit_price``."""
+        return self.amend_cancel_order(
+            stock_code=stock_code, orgn_odno=orgn_odno, rvse_cncl_dvsn_cd="01",
+            krx_fwdg_ord_orgno=krx_fwdg_ord_orgno, ord_dvsn=ord_dvsn,
+            quantity=quantity, limit_price=limit_price, qty_all_ord_yn=qty_all_ord_yn,
+            dry_run=dry_run,
+        )
+
+    def cancel_order(self, stock_code: str, orgn_odno: str,
+                     krx_fwdg_ord_orgno: str = "", ord_dvsn: str = "00",
+                     quantity: int = 0, qty_all_ord_yn: str = "Y",
+                     dry_run: bool = False) -> Dict[str, Any]:
+        """Convenience wrapper: cancel (취소) an existing order."""
+        return self.amend_cancel_order(
+            stock_code=stock_code, orgn_odno=orgn_odno, rvse_cncl_dvsn_cd="02",
+            krx_fwdg_ord_orgno=krx_fwdg_ord_orgno, ord_dvsn=ord_dvsn,
+            quantity=quantity, limit_price=0, qty_all_ord_yn=qty_all_ord_yn,
+            dry_run=dry_run,
+        )
+
+    def get_revisable_orders(self, stock_code: str = None) -> List[Dict[str, Any]]:
+        """Inquire revisable/cancellable (= still-open / unfilled) orders.
+
+        TR: 주식정정취소가능주문조회 — real TTTC0084R. Returns a normalised list of
+        open orders, optionally filtered to ``stock_code``. Returns [] on any
+        failure (degrade to no-op — Loop C must treat empty as "nothing to chase",
+        never as "everything filled").
+
+        Each dict: {order_no, orgn_odno, stock_code, ord_qty, ord_unpr,
+                    tot_ccld_qty, psbl_qty, sll_buy_dvsn_cd, ord_dvsn,
+                    krx_fwdg_ord_orgno}.
+        """
+        api_url = "/uapi/domestic-stock/v1/trading/inquire-psbl-rvsecncl"
+
+        # TODO(live-validate): paper tr_id VTTC0084R is UNVERIFIED in the KIS
+        # sample repo. Real TTTC0084R confirmed. Loop C runs SHADOW by default.
+        if self.mode == "real":
+            tr_id = "TTTC0084R"
+        else:
+            tr_id = "VTTC0084R"
+
+        params = {
+            "CANO": self.trenv.my_acct,
+            "ACNT_PRDT_CD": self.trenv.my_prod,
+            "INQR_DVSN_1": "1",
+            "INQR_DVSN_2": "0",
+            "CTX_AREA_FK100": "",
+            "CTX_AREA_NK100": "",
+        }
+
+        out: List[Dict[str, Any]] = []
+        try:
+            res = self._request(api_url, tr_id, params)
+            if not res.isOK():
+                error_msg = f"{res.getErrorCode()} - {res.getErrorMessage()}"
+                logger.warning(f"Revisable-order inquiry failed: {error_msg}")
+                return out
+
+            output1 = res.getBody().output
+            if not isinstance(output1, list):
+                output1 = [output1] if output1 else []
+
+            for row in output1:
+                code = str(row.get('pdno', '') or '').strip()
+                if stock_code and code != stock_code:
+                    continue
+                out.append({
+                    'order_no': row.get('odno', ''),
+                    'orgn_odno': row.get('orgn_odno', ''),
+                    'stock_code': code,
+                    'ord_qty': _safe_int(row.get('ord_qty')),
+                    'ord_unpr': _safe_int(row.get('ord_unpr')),
+                    'tot_ccld_qty': _safe_int(row.get('tot_ccld_qty')),
+                    'psbl_qty': _safe_int(row.get('psbl_qty')),  # cancellable/amendable qty
+                    'sll_buy_dvsn_cd': row.get('sll_buy_dvsn_cd', ''),  # 01 sell / 02 buy
+                    'ord_dvsn': row.get('ord_dvsn_cd', ''),
+                    'krx_fwdg_ord_orgno': row.get('ord_gno_brno', ''),
+                })
+            return out
+
+        except Exception as e:
+            logger.warning(f"Error during revisable-order inquiry: {str(e)}")
+            return out
+
 
 class MultiAccountDomesticStockTrading:
     """Fan out trading orders to all configured domestic accounts for the current mode."""
@@ -1576,7 +1976,7 @@ class MultiAccountDomesticStockTrading:
 
         return self._aggregate_results(stock_code, results, action="buy")
 
-    async def async_sell_stock(self, stock_code: str, timeout: float = 30.0, limit_price: Optional[int] = None) -> Dict[str, Any]:
+    async def async_sell_stock(self, stock_code: str, timeout: float = 30.0, limit_price: Optional[int] = None, quantity: Optional[int] = None) -> Dict[str, Any]:
         if not self.account_configs:
             return self._aggregate_results(stock_code, [], action="sell")
         results = []
@@ -1586,6 +1986,7 @@ class MultiAccountDomesticStockTrading:
                 stock_code=stock_code,
                 timeout=timeout,
                 limit_price=limit_price,
+                quantity=quantity,
             )
             result["account_name"] = account["name"]
             result["account_key"] = account["account_key"]

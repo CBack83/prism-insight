@@ -588,7 +588,7 @@ class USStockAnalysisOrchestrator:
             report_paths: List of markdown report file paths (for translation)
         """
         if not self.telegram_config.use_telegram:
-            logger.info(f"Telegram disabled - skipping US message and PDF transmission")
+            logger.info("Telegram disabled - skipping US message and PDF transmission")
             return
 
         logger.info(f"Starting US telegram message transmission for {len(message_paths)} messages")
@@ -636,6 +636,16 @@ class USStockAnalysisOrchestrator:
                     logger.error(f"PDF file transmission failed: {pdf_path}")
                 await asyncio.sleep(1)
 
+            # Phase 6 S6: broadcast annotated insight images (default-OFF, non-blocking).
+            # One image per company AFTER its PDF. Gated on PRISM_FEATURE_INSIGHT_IMAGE;
+            # never raises. (Under US `cores` shadowing the KR chart path is absent,
+            # so build_insight_image_for degrades to None and this no-ops safely.)
+            try:
+                from cores.llm.features.insight_broadcast import broadcast_insight_images
+                await broadcast_insight_images(bot_agent, chat_id, pdf_paths, market="us")
+            except Exception as e:
+                logger.warning(f"[INSIGHT_IMAGE] US broadcast skipped: {e}")
+
             # Send translated PDFs to broadcast channels asynchronously (non-blocking)
             if self.telegram_config.broadcast_languages and report_paths:
                 self._broadcast_tasks.append(
@@ -661,7 +671,7 @@ class USStockAnalysisOrchestrator:
                         logger.info(f"Translating US telegram message to {lang}")
                         translated_message = await translate_telegram_message(
                             original_message,
-                            model="gpt-5-nano",
+                            model="gpt-5.4-nano",
                             from_lang="ko",
                             to_lang=lang
                         )
@@ -703,7 +713,9 @@ class USStockAnalysisOrchestrator:
             report_paths: List of original markdown report file paths
         """
         try:
-            async def _translate_pdfs_for_lang(lang, channel_id):
+            from pdf_converter import PdfRenderer
+
+            async def _translate_pdfs_for_lang(lang, channel_id, renderer):
                 for report_path in report_paths:
                     try:
                         logger.info(f"Translating US markdown report {report_path} to {lang}")
@@ -716,7 +728,7 @@ class USStockAnalysisOrchestrator:
 
                         translated_report = await translate_telegram_message(
                             text_for_translation,
-                            model="gpt-5-nano",
+                            model="gpt-5.4-nano",
                             from_lang="ko",
                             to_lang=lang
                         )
@@ -732,10 +744,12 @@ class USStockAnalysisOrchestrator:
 
                         logger.info(f"Translated US report saved: {translated_report_path}")
 
-                        translated_pdf_paths = await self.convert_to_pdf([str(translated_report_path)])
+                        translated_pdf_file = US_PDF_REPORTS_DIR / f"{Path(translated_report_path).stem}.pdf"
+                        translated_pdf_path = await renderer.render(
+                            str(translated_report_path), str(translated_pdf_file)
+                        )
 
-                        if translated_pdf_paths and len(translated_pdf_paths) > 0:
-                            translated_pdf_path = translated_pdf_paths[0]
+                        if translated_pdf_path:
                             logger.info(f"Sending translated US PDF {translated_pdf_path} to {lang} channel")
                             success = await bot_agent.send_document(channel_id, str(translated_pdf_path), msg_type="pdf", market="us")
 
@@ -755,18 +769,21 @@ class USStockAnalysisOrchestrator:
                             await send_openai_quota_alert(self.telegram_config, market="US")
                             return
 
-            # Process languages sequentially to limit memory usage
-            # (each PDF generation spawns a Playwright/Chromium instance)
-            for lang in self.telegram_config.broadcast_languages:
-                channel_id = self.telegram_config.get_broadcast_channel_id(lang)
-                if not channel_id:
-                    logger.warning(f"No channel ID configured for language: {lang}")
-                    continue
-                logger.info(f"Processing PDF translation for US {lang} channel (sequential)")
-                try:
-                    await _translate_pdfs_for_lang(lang, channel_id)
-                except Exception as lang_err:
-                    logger.error(f"US PDF translation failed for {lang}: {lang_err}")
+            # Languages are still processed one page at a time (memory ceiling stays
+            # at a single Chromium), but a SHARED browser is reused across all of
+            # them so the Chromium launch cost is paid ONCE instead of once per file
+            # (previously N launches for N PDFs — the batch's main slow tail).
+            async with PdfRenderer() as renderer:
+                for lang in self.telegram_config.broadcast_languages:
+                    channel_id = self.telegram_config.get_broadcast_channel_id(lang)
+                    if not channel_id:
+                        logger.warning(f"No channel ID configured for language: {lang}")
+                        continue
+                    logger.info(f"Processing PDF translation for US {lang} channel (shared browser)")
+                    try:
+                        await _translate_pdfs_for_lang(lang, channel_id, renderer)
+                    except Exception as lang_err:
+                        logger.error(f"US PDF translation failed for {lang}: {lang_err}")
 
         except Exception as e:
             logger.error(f"Error in _send_translated_pdfs: {str(e)}")
@@ -799,7 +816,7 @@ class USStockAnalysisOrchestrator:
                     all_results[key] = value
 
             if not all_results:
-                logger.warning(f"No US trigger results found.")
+                logger.warning("No US trigger results found.")
                 return False
 
             # Include metadata for hybrid selection info in alert message
@@ -857,7 +874,7 @@ class USStockAnalysisOrchestrator:
                     logger.info(f"Translating US trigger alert to {lang}")
                     translated_message = await translate_telegram_message(
                         original_message,
-                        model="gpt-5-nano",
+                        model="gpt-5.4-nano",
                         from_lang="ko",
                         to_lang=lang
                     )

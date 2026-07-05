@@ -124,10 +124,14 @@ B) 없으면 S&P 500 (^GSPC) + VIX 최근 20일 데이터(yahoo_finance-get_hist
 
 하나라도 미달 → 일반 `strong_bull` 행으로 fallback (R/R 1.0, 손절 -7%).
 
-**Distribution Day Kill Switch (parabolic 활성화를 무력화):**
-보고서 또는 분석에서 최근 4주 내 분포일(거래량 동반 -0.2%↓ 마감) ≥ 4건이 확인되면
-regime을 1단계 보수화하십시오 (parabolic → strong_bull, strong_bull → moderate_bull,
-moderate_bull → sideways). 보수화 사실을 `market_condition` 필드에 명시하십시오.
+**Distribution Day Kill Switch (신규매수 방어 전용):**
+분포일(거래량 동반 -0.2%↓ 마감)은 `index_summary.distribution_days`에 **결정론적으로 집계**됩니다
+(최근 25거래일 윈도우, +5% 회복 시 만료; 거래량 결측이면 null → 보고서 최근 4주 내 분포일로 판단).
+이 값이 높을수록 기관 분배가 진행 중이라는 천장 경고입니다.
+- 값이 높으면(통상 5~6건 이상) **신규 매수에 한해** regime을 1단계 보수적으로 적용하십시오
+  (parabolic → strong_bull, strong_bull → moderate_bull, moderate_bull → sideways): 신규 진입·parabolic 사이징의 문턱만 높입니다.
+- **보유 종목의 매도·trailing 판단은 원래 regime을 그대로 사용**하며, 분산일로 조기 청산하지 않습니다.
+- distribution_days 값과 신규매수 보수화 여부를 `market_condition` 필드에 명시하십시오.
 
 **parabolic 포지션 운영** (parabolic 행이 활성화될 때):
 - 적극 매수 권장: max_portfolio_size를 보고서 기준값 그대로 사용하십시오. **슬롯 축소 금지**.
@@ -262,6 +266,13 @@ risk_reward_ratio  = expected_return_pct / expected_loss_pct
 - **장 후반 (마감 1시간 전 이후)**: 당일 데이터가 사실상 확정. 모든 기술적 지표를 사용해도 됩니다.
 - 분석이 미국 시장 마감 후(아침 KST)에 실행되는 경우 직전 거래일 종가 기준으로 판단하십시오.
 
+## 매매일지·직관 활용 (주입된 경우)
+프롬프트에 "Same Stock Past Trading History" 또는 "Accumulated Trading Intuitions"가 주어지면 신중히 가중하십시오:
+- 이 종목을 **최근(≤5거래일) 매도**했거나(특히 ⚠️ 태그가 붙은 경우), 과거 **유사 패턴·느낌의 손실 이력**이 있으면 추격 재진입을 한 박자 늦추고 손익비·셋업을 더 엄격히 보십시오.
+- 다만 매매일지 하나만 보고 기계적으로 미진입하지는 마십시오 — 현재 셋업이 과거와 **무엇이 다른지**를 판단하는 것이 핵심입니다.
+- 최근 매도 이력에도 진입한다면 rationale에 "지금이 왜 다른가"를 명시하고, journal_reflection 필드를 채우십시오.
+- journal_reflection은 항상 출력하십시오. 주입된 일지가 없으면 referenced=false, 나머지는 null로 두십시오.
+
 ## JSON 응답 형식
 
 key_levels의 가격 필드 형식: `170` / `"170"` / `"170~180"` (범위는 중간값 사용).
@@ -297,6 +308,11 @@ key_levels의 가격 필드 형식: `170` / `"170"` / `"170~180"` (범위는 중
     "sector": "GICS 섹터명. 반드시 다음 중 하나: {sector_constraint}",
     "market_condition": "regime + 1줄 근거",
     "max_portfolio_size": 6~10 사이 정수,
+    "journal_reflection": {
+        "referenced": true 또는 false (주입된 매매일지/직관이 이번 판단에 실제로 영향을 줬는가),
+        "recent_exit_caution": "이 종목을 최근(≤5거래일) 매도했거나 과거 유사 손실 패턴이 있으면 그 주의점 1줄, 없으면 null",
+        "applied_lessons": "반영한 매매일지·직관 교훈 1줄과 그것이 판단을 어떻게 바꿨는지 (없으면 null)"
+    },
     "trading_scenarios": {
         "key_levels": {
             "primary_support": 숫자,
@@ -415,11 +431,17 @@ Apply the **parabolic** row ONLY when ALL of the following hold:
 
 If any condition fails → fall back to the standard `strong_bull` row (R/R floor 1.0, stop -7%).
 
-**Distribution Day Kill Switch (overrides parabolic activation):**
-If the report or analysis shows ≥ 4 distribution days (institutional selling sessions
-with ≥ -0.2% close on rising volume) within the last 4 weeks → demote regime by ONE step
-(parabolic → strong_bull, strong_bull → moderate_bull, moderate_bull → sideways).
-State the demotion in `market_condition` field.
+**Distribution Day Kill Switch (new-buy defense only):**
+Distribution days (institutional selling sessions with ≥ -0.2% close on rising volume) are
+counted **deterministically** in `index_summary.distribution_days` (rolling 25-session window,
+expiring on a +5% recovery; null when volume is missing → then judge from the report's last
+4 weeks). The HIGHER this count of distribution days, the more institutional selling is underway.
+- When it is elevated (≈5-6 or more), apply ONE step of caution to NEW BUYS ONLY
+  (parabolic → strong_bull, strong_bull → moderate_bull, moderate_bull → sideways): raise the bar
+  for new entries / parabolic sizing.
+- Do NOT change sell or trailing-stop decisions for existing holdings — those keep the original
+  regime. Distribution days never force an early exit.
+- State the distribution_days value and any new-buy caution in the `market_condition` field.
 
 **Parabolic position management** (apply when parabolic row is active):
 - Active buying recommended: use the report-derived max_portfolio_size as-is. Do NOT reduce slots.
@@ -564,6 +586,13 @@ If the resulting R/R is below the matrix floor for the current regime → No Ent
 - **Closing hour onward**: today's data is settled. All technical indicators are usable.
 - When the analysis runs after US market close (KST morning), use the most recent settled session.
 
+## Using the Trading Journal & Intuitions (when injected)
+When the prompt includes "Same Stock Past Trading History" or "Accumulated Trading Intuitions", weigh them carefully:
+- If this stock was **exited recently (<=5 trading days)** (especially when tagged ⚠️), or shows a **past similar-loss pattern**, slow down a chase re-entry and apply stricter R/R and setup checks.
+- Do NOT mechanically skip based on the journal alone — the key is judging **what is different now** versus the past setup.
+- If you still enter despite a recent exit, state "why now is different" in the rationale and fill the journal_reflection field.
+- Always output journal_reflection. If no journal was injected, set referenced=false and the rest null.
+
 ## JSON Response Format
 
 key_levels price formats: `170` / `"170"` / `"170~180"` (range midpoint used).
@@ -599,6 +628,11 @@ Prohibited: `"$170"`, `"about $170"`, `"minimum 170"`.
     "sector": "GICS sector name. Must be one of: {sector_constraint}",
     "market_condition": "regime + 1-line evidence",
     "max_portfolio_size": Integer 6~10,
+    "journal_reflection": {
+        "referenced": true or false (did the injected trading journal/intuitions materially inform this decision),
+        "recent_exit_caution": "If this stock was exited recently (<=5 trading days) or shows a past similar-loss pattern, the 1-line caution; else null",
+        "applied_lessons": "1-line: which journal/intuition lesson was weighed and how it shifted the decision (null if none)"
+    },
     "trading_scenarios": {
         "key_levels": {
             "primary_support": Number,
@@ -674,6 +708,21 @@ def create_us_sell_decision_agent(language: str = "ko"):
 → **약세장/횡보장**: 위 조건 미충족
 
 ### 0순위: 매도 판단의 핵심 원칙 (반드시 준수)
+
+**핵심-0) 법인 이벤트 최우선 점검 (뉴스 기반 강제청산):**
+- 매 판단 시 **반드시 먼저** perplexity 도구로 **구체적 키워드**로 영문 검색하십시오:
+  `"<company> tender offer OR going private"`, `"<company> delisting"`,
+  `"<company> bankruptcy OR Chapter 11 OR SEC deregistration"` (회사명 + 티커 + 2026). 최소 2개 쿼리.
+- **다음 중 하나라도 공식 확인되면 = 매도 트리거(최종 상폐일 미정이어도 매도):**
+  ① **공개매수/비공개전환(tender offer / going-private) 공식 발표·진행** (인수자·가격 명시)
+  ② 거래소 상장요건 미달 퇴출(NYSE/Nasdaq compliance delisting) / SEC 등록취소(Form 25)
+  ③ 파산(Chapter 11) / 합병·피인수 완료로 인한 상장폐지 / 거래정지
+  → **should_sell = true (전량 매도)**, sell_reason 맨 앞에 `[법인이벤트]` + 유형·근거(출처/날짜).
+  **이유: 공개매수/비공개전환 진행 중이면 주가가 인수가에 고정되어 상승 여력이 없고, 상폐 전 청산하지
+  않으면 비상장 전환으로 자금이 묶인다. 공식 발표된 건은 '루머'가 아니라 확정 이벤트다.**
+- **보류(보유)는 오직 회사가 부인했거나 '인수설/합병설' 수준의 미확인 단일 추측 기사뿐일 때만.**
+  공식 발표된 tender offer/going-private를 "최종 상폐일 미확정"을 이유로 미루지 말 것 — 이미 확정 사유다.
+- 이벤트가 없으면 아래 핵심-1~4의 기술적 판단을 정상 진행하십시오.
 
 **핵심-1) 종가 기준 (Closing-Price Rule):**
 - 모든 손절가·trailing stop 판단은 **종가(closing price)** 기준입니다.
@@ -873,6 +922,23 @@ You are a professional analyst specializing in sell timing decisions for US stoc
 
 ### Priority 0: Core Principles for Sell Judgement (MUST follow)
 
+**Core-0) Corporate-Event Check First (news-driven forced exit):**
+- On EVERY decision, FIRST use the perplexity tool with **specific keyword queries**:
+  `"<company> tender offer OR going private"`, `"<company> delisting"`,
+  `"<company> bankruptcy OR Chapter 11 OR SEC deregistration"` (company + ticker + 2026). Run 2+ queries.
+- **If ANY of these is officially confirmed = SELL trigger (even if the final delisting DATE is not set):**
+  (1) **tender offer / going-private announced or ongoing** (acquirer & price stated)
+  (2) exchange compliance delisting (NYSE/Nasdaq) / SEC deregistration (Form 25)
+  (3) bankruptcy (Chapter 11) / merger-driven delisting / trading halt
+  → set **should_sell = true (full exit)**, prefix sell_reason with `[CORP_EVENT]` + type & evidence.
+  **Why: while a tender offer / going-private is in progress the price is pinned at the offer price (no
+  upside) and not exiting before delisting locks your capital in unlisted shares. An officially announced
+  deal is NOT a rumor — it is a confirmed event.**
+- **Hold ONLY when it is just an unconfirmed single-source 'acquisition/merger rumor' or the company denied
+  it.** Do NOT defer an officially announced tender offer / going-private because "the final delisting date
+  is unconfirmed" — that already qualifies as confirmed.
+- If no event, proceed normally with Core-1~4 technical judgement below.
+
 **Core-1) Closing-Price Rule:**
 - All stop_loss and trailing-stop judgements are based on the **closing price**.
 - An intraday low that briefly touches stop_loss (intraday wick) is NEVER a sell reason on its own.
@@ -989,5 +1055,6 @@ Trailing Stop %: Bull peak × 0.92 (-8%), Bear/Sideways peak × 0.95 (-5%)
     return Agent(
         name="us_sell_decision_agent",
         instruction=instruction,
-        server_names=["yahoo_finance", "sqlite", "time"]
+        # perplexity: 핵심-0 법인 이벤트(상폐/공개매수/파산 등) 뉴스 자율 점검에 필요
+        server_names=["yahoo_finance", "sqlite", "time", "perplexity"]
     )

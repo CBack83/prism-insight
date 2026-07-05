@@ -18,12 +18,10 @@ import asyncio
 import json
 import logging
 import os
-import re
 import sqlite3
 import sys
 import traceback
-from datetime import datetime, timedelta
-from pathlib import Path
+from datetime import datetime
 from typing import List, Dict, Any, Tuple, Optional
 
 import cores.openai_debug  # noqa: F401 — OpenAI 400/429 request metadata logging
@@ -51,6 +49,17 @@ from cores.openai_error_logging import log_openai_error
 from cores.agents.trading_agents import create_trading_scenario_agent
 from cores.utils import parse_llm_json
 
+# O'Neil 룰베이스 매도 (2026-06-04 US quota 사고 동일 룰 결함 KR에도 적용).
+# 방어적 import: 실패 시 _ONEIL_FALLBACK_AVAILABLE=False 로 기존 레거시 룰 유지.
+try:
+    from cores.oneil_fallback import (
+        evaluate_oneil_sell as _oneil_eval,
+        from_stock_data as _oneil_from,
+    )
+    _ONEIL_FALLBACK_AVAILABLE = True
+except Exception:  # pragma: no cover - defensive
+    _ONEIL_FALLBACK_AVAILABLE = False
+
 # Tracking package imports (refactored helpers)
 from tracking import (
     create_all_tables,
@@ -66,11 +75,10 @@ from tracking import (
     check_sector_diversity,
     parse_price_value,
     default_scenario,
-    analyze_sell_decision,
-    format_buy_message,
-    format_sell_message,
-    calculate_profit_rate,
-    calculate_holding_days,
+    get_existing_position_for_ticker,
+    evaluate_pyramid_add_gate,
+    pyramid_add_possible_ignoring_regime,
+    compute_fractional_sell_quantity,
     JournalManager,
     CompressionManager,
     TelegramSender,
@@ -132,13 +140,20 @@ class StockTrackingAgent:
         if self.telegram_token:
             self.telegram_bot = Bot(token=self.telegram_token)
 
-    async def initialize(self, language: str = "ko", sector_names: list = None):
+    async def initialize(self, language: str = "ko", sector_names: list = None,
+                         skip_llm_agent: bool = False):
         """
         Create necessary tables and initialize
 
         Args:
             language: Language code for agents (default: "ko")
             sector_names: List of valid sector names for trading agent (optional)
+            skip_llm_agent: When True, skip creating the LLM trading-scenario agent.
+                The sell path (sell_stock / send_telegram_message) does NOT use
+                self.trading_agent, so lightweight consumers (e.g. the LLM-free
+                Loop A hard-stop loop) can reuse the sell/journal/telegram plumbing
+                without pulling in the heavy LLM agent. Default False keeps the
+                batch behaviour byte-for-byte unchanged.
         """
         logger.info("Starting tracking agent initialization")
         logger.info(f"Trading journal feature: {'enabled' if self.enable_journal else 'disabled'}")
@@ -151,8 +166,10 @@ class StockTrackingAgent:
         self.conn.row_factory = sqlite3.Row  # Return results as dictionary
         self.cursor = self.conn.cursor()
 
-        # Initialize trading scenario generation agent with language and sector names
-        self.trading_agent = create_trading_scenario_agent(language=language, sector_names=sector_names)
+        # Initialize trading scenario generation agent with language and sector names.
+        # Skipped for lightweight sell-only consumers (see skip_llm_agent docstring).
+        self.trading_agent = None if skip_llm_agent else \
+            create_trading_scenario_agent(language=language, sector_names=sector_names)
 
         # Create database tables
         await self._create_tables()
@@ -310,6 +327,7 @@ class StockTrackingAgent:
             # Get trading journal context for informed decisions
             journal_context = ""
             score_adjustment_info = ""
+            adjustment, reasons = 0, []
             if ticker:
                 journal_context = self._get_relevant_journal_context(
                     ticker=ticker,
@@ -405,6 +423,12 @@ class StockTrackingAgent:
             # TODO: Create model and call generate_structured function to improve code maintainability
             scenario_json = parse_llm_json(response, context='trading scenario')
             if scenario_json is not None:
+                # Persist the experience-based score adjustment alongside the scenario.
+                # It rides inside the scenario JSON, which is stored in
+                # stock_holdings.scenario and copied to trading_history.scenario on sell —
+                # giving the weekly influence report a journal-impact signal for free (#280).
+                if adjustment != 0 or reasons:
+                    scenario_json["score_adjustment"] = {"value": adjustment, "reasons": reasons}
                 logger.info(f"Scenario parsed: {json.dumps(scenario_json, ensure_ascii=False)[:200]}")
                 return scenario_json
 
@@ -493,6 +517,46 @@ class StockTrackingAgent:
         Returns:
             Dict: Trading decision result
         """
+        # Cheap pre-gate: skip the per-stock scenario LLM for a held stock that
+        # cannot pyramid-add (#288) regardless of regime. The full add-gate requires
+        # (row_count < max) AND (profit >= min) — both regime-independent and computed
+        # from DB + price only. When they fail, the full path returns "Already holding"
+        # anyway, so we return that here without paying for the ~2.5min scenario LLM.
+        # Winners with room fall through to full analysis (the LLM supplies
+        # market_condition for the regime check), so pyramiding is fully preserved.
+        # Fail-open: any error in the cheap check falls back to full analysis.
+        try:
+            pre_ticker, pre_company = await self._extract_ticker_info(pdf_report_path)
+        except Exception:
+            pre_ticker, pre_company = None, None
+        if pre_ticker and await self._is_ticker_in_holdings(pre_ticker):
+            try:
+                account_key, _ = self._account_scope()
+                existing = get_existing_position_for_ticker(self.cursor, pre_ticker, account_key=account_key)
+                pre_price = await self._get_current_stock_price(pre_ticker)
+                can_add, why = pyramid_add_possible_ignoring_regime(
+                    existing_avg_buy_price=existing.get("avg_buy_price", 0.0),
+                    current_price=pre_price,
+                    existing_row_count=existing.get("row_count", 0),
+                )
+            except Exception as e:
+                logger.warning(
+                    f"{pre_ticker} pyramid pre-gate check failed ({e}); running full analysis"
+                )
+                can_add = True  # fail-open: never skip analysis on uncertainty
+            if not can_add:
+                logger.info(
+                    f"{pre_ticker}({pre_company}) already in holdings — pyramid pre-gate "
+                    f"blocked ({why}); skipping scenario LLM"
+                )
+                return {
+                    "success": True,
+                    "decision": "Already holding",
+                    "ticker": pre_ticker,
+                    "company_name": pre_company,
+                    "current_price": pre_price,
+                }
+
         analysis_result = await self._analyze_report_core(pdf_report_path)
         if not analysis_result.get("success", False):
             return analysis_result
@@ -502,14 +566,34 @@ class StockTrackingAgent:
 
         is_holding = await self._is_ticker_in_holdings(ticker)
         if is_holding:
-            logger.info(f"{ticker}({company_name}) already in holdings")
-            return {
-                "success": True,
-                "decision": "Already holding",
-                "ticker": ticker,
-                "company_name": company_name,
-                "current_price": analysis_result.get("current_price", 0),
-            }
+            # Pyramiding (#288): allow an additional independent entry only when the
+            # strong-bull add-gate passes. Otherwise keep the legacy hard block.
+            scenario = analysis_result.get("scenario", {}) or {}
+            current_price = analysis_result.get("current_price", 0)
+            account_key, _ = self._account_scope()
+            existing = get_existing_position_for_ticker(self.cursor, ticker, account_key=account_key)
+            allowed, reason = evaluate_pyramid_add_gate(
+                market_condition=scenario.get("market_condition", ""),
+                existing_avg_buy_price=existing.get("avg_buy_price", 0.0),
+                current_price=current_price,
+                existing_row_count=existing.get("row_count", 0),
+            )
+            if not allowed:
+                logger.info(f"{ticker}({company_name}) already in holdings — add gate blocked: {reason}")
+                return {
+                    "success": True,
+                    "decision": "Already holding",
+                    "ticker": ticker,
+                    "company_name": company_name,
+                    "current_price": current_price,
+                }
+
+            logger.info(f"{ticker}({company_name}) pyramiding add gate passed: {reason}")
+            # Tag as an add and pass through to the normal buy path (which still
+            # independently gates on Enter/score/sector_diverse).
+            analysis_result["is_add"] = True
+            analysis_result["existing_avg_buy_price"] = existing.get("avg_buy_price", 0.0)
+            analysis_result["existing_row_count"] = existing.get("row_count", 0)
 
         sector = analysis_result.get("sector", "Unknown")
         analysis_result["sector_diverse"] = await self._check_sector_diversity(sector)
@@ -669,7 +753,7 @@ class StockTrackingAgent:
             logger.error(traceback.format_exc())
             return False
 
-    async def buy_stock(self, ticker: str, company_name: str, current_price: float, scenario: Dict[str, Any], rank_change_msg: str = "") -> bool:
+    async def buy_stock(self, ticker: str, company_name: str, current_price: float, scenario: Dict[str, Any], rank_change_msg: str = "", is_add: bool = False) -> bool:
         """
         Process stock purchase
 
@@ -679,13 +763,15 @@ class StockTrackingAgent:
             current_price: Current stock price
             scenario: Trading scenario information
             rank_change_msg: Trading value ranking change info
+            is_add: Pyramiding add (#288) — bypass the already-holding re-check and
+                    insert an independent additional row instead of a first entry.
 
         Returns:
             bool: Purchase success status
         """
         try:
-            # Check if already holding
-            if await self._is_ticker_in_holdings(ticker):
+            # Check if already holding (skipped for a pyramiding add)
+            if not is_add and await self._is_ticker_in_holdings(ticker):
                 logger.warning(f"{ticker}({company_name}) already in holdings")
                 return False
 
@@ -742,13 +828,27 @@ class StockTrackingAgent:
             )
             self.conn.commit()
 
-            # Add purchase message
-            message = f"📈 신규 매수: {company_name}({ticker})\n" \
-                      f"매수가: {current_price:,.0f}원\n" \
-                      f"목표가: {scenario.get('target_price', 0):,.0f}원\n" \
-                      f"손절가: {scenario.get('stop_loss', 0):,.0f}원\n" \
-                      f"투자기간: {scenario.get('investment_period', '단기')}\n" \
-                      f"산업군: {scenario.get('sector', '알 수 없음')}\n"
+            # Add purchase message — pyramiding adds (#288) get a distinct header
+            # showing the entry number and the new aggregate average price.
+            if is_add:
+                agg = get_existing_position_for_ticker(self.cursor, ticker, account_key=account_key)
+                entry_no = agg.get("row_count", 1)  # this entry is the Nth row
+                new_avg = agg.get("avg_buy_price", current_price)
+                message = f"📈 추가 진입 ({entry_no}차): {company_name}({ticker})\n" \
+                          f"이번 진입가: {current_price:,.0f}원\n" \
+                          f"누적 평단가: {new_avg:,.0f}원\n" \
+                          f"⚠️ 포트폴리오 비중이 증가했습니다 (독립 슬롯 1 소비)\n" \
+                          f"목표가: {scenario.get('target_price', 0):,.0f}원\n" \
+                          f"손절가: {scenario.get('stop_loss', 0):,.0f}원\n" \
+                          f"투자기간: {scenario.get('investment_period', '단기')}\n" \
+                          f"산업군: {scenario.get('sector', '알 수 없음')}\n"
+            else:
+                message = f"📈 신규 매수: {company_name}({ticker})\n" \
+                          f"매수가: {current_price:,.0f}원\n" \
+                          f"목표가: {scenario.get('target_price', 0):,.0f}원\n" \
+                          f"손절가: {scenario.get('stop_loss', 0):,.0f}원\n" \
+                          f"투자기간: {scenario.get('investment_period', '단기')}\n" \
+                          f"산업군: {scenario.get('sector', '알 수 없음')}\n"
 
             # Add trigger win rate
             trigger_win_rate = self._get_trigger_win_rate(trigger_type)
@@ -768,7 +868,20 @@ class StockTrackingAgent:
                 message += f"거래대금 분석: {rank_change_msg}\n"
 
             message += f"투자근거: {scenario.get('rationale', '정보 없음')}\n"
-            
+
+            # Surface journal-grounded reasoning so the feedback loop is transparent (#280).
+            # All fields are optional — defends against scenarios without journal_reflection.
+            _jr = scenario.get('journal_reflection') or {}
+            if isinstance(_jr, dict):
+                if _jr.get('recent_exit_caution'):
+                    message += f"⚠️ 최근 매도 주의: {_jr.get('recent_exit_caution')}\n"
+                if _jr.get('applied_lessons'):
+                    message += f"📒 매매일지 반영: {_jr.get('applied_lessons')}\n"
+            _sadj = scenario.get('score_adjustment') or {}
+            if isinstance(_sadj, dict) and _sadj.get('value'):
+                _rsn = ', '.join(_sadj.get('reasons', []) or [])
+                message += f"📊 경험 기반 점수조정: {_sadj.get('value'):+d}점 ({_rsn})\n"
+
             # Format trading scenario
             trading_scenarios = scenario.get('trading_scenarios', {})
             if trading_scenarios and isinstance(trading_scenarios, dict):
@@ -785,7 +898,7 @@ class StockTrackingAgent:
                     primary_resistance = self._parse_price_value(key_levels.get('primary_resistance', 0))
                     secondary_resistance = self._parse_price_value(key_levels.get('secondary_resistance', 0))
                     if primary_resistance or secondary_resistance:
-                        message += f"  📈 저항선:\n"
+                        message += "  📈 저항선:\n"
                         if secondary_resistance:
                             message += f"    • 2차: {secondary_resistance:,.0f}원\n"
                         if primary_resistance:
@@ -798,7 +911,7 @@ class StockTrackingAgent:
                     primary_support = self._parse_price_value(key_levels.get('primary_support', 0))
                     secondary_support = self._parse_price_value(key_levels.get('secondary_support', 0))
                     if primary_support or secondary_support:
-                        message += f"  📉 지지선:\n"
+                        message += "  📉 지지선:\n"
                         if primary_support:
                             message += f"    • 1차: {primary_support:,.0f}원\n"
                         if secondary_support:
@@ -853,9 +966,26 @@ class StockTrackingAgent:
             logger.error(traceback.format_exc())
             return False
 
+    def _get_live_regime_safe(self) -> Optional[str]:
+        """매도 판단용 '현재' KOSPI 레짐을 1회 계산(OpenAI 무관). 실패 시 None → stale 폴백."""
+        try:
+            from cores.data_prefetch import prefetch_macro_intelligence_data
+            reference_date = datetime.now().strftime("%Y%m%d")
+            data = prefetch_macro_intelligence_data(reference_date) or {}
+            regime = (data.get("computed_regime") or {}).get("market_regime")
+            if regime:
+                logger.info(f"[sell] live KR market regime: {regime}")
+            return regime or None
+        except Exception as e:
+            logger.warning(f"[sell] live regime fetch failed, using stale market_condition: {e}")
+            return None
+
     async def _analyze_sell_decision(self, stock_data: Dict[str, Any]) -> Tuple[bool, str]:
         """
         Sell decision analysis
+
+        1차: O'Neil 추세추종 룰(cores.oneil_fallback) — 승자 보유/손실 차단.
+        2차(안전망): O'Neil 모듈 불가/예외 시에만 기존 레거시 룰.
 
         Args:
             stock_data: Stock information
@@ -863,6 +993,40 @@ class StockTrackingAgent:
         Returns:
             Tuple[bool, str]: Whether to sell, sell reason
         """
+        # ── TIER0: 법인 이벤트 강제청산 (가격/레짐 무관, 최우선) ──────
+        # KIS 종목상태코드(관리종목 51) 결정론 자동탐지. 상폐/공개매수 등 뉴스성
+        # 이벤트는 매도 AI 프롬프트(핵심-0)의 perplexity 뉴스 점검이 자율 처리.
+        # 여기서 True면 시뮬+KIS 양쪽이 다음 사이클에 시장가 자동 청산(정규장 기준).
+        try:
+            from cores.corporate_status import check_event_exit
+            ev_sell, ev_reason = check_event_exit(
+                stock_data.get("ticker", ""),
+                kis_status_code=stock_data.get("_kis_stat_code"),
+                market="KR",
+            )
+            if ev_sell:
+                logger.warning(
+                    f"{stock_data.get('ticker','')} TIER0 event force-exit: {ev_reason}"
+                )
+                return True, ev_reason
+        except Exception as e:
+            logger.warning(f"{stock_data.get('ticker','')} TIER0 event check skipped: {e}")
+
+        # ── O'Neil 룰베이스 (live regime 주입) ───────────────────
+        if _ONEIL_FALLBACK_AVAILABLE:
+            try:
+                live_regime = getattr(self, "_live_regime_cache", None)
+                inp = _oneil_from(stock_data, live_regime=live_regime)
+                should_sell, reason = _oneil_eval(inp)
+                logger.info(
+                    f"{stock_data.get('ticker','')} O'Neil rule-based sell: "
+                    f"{'Sell' if should_sell else 'Hold'} | {reason}"
+                )
+                return should_sell, reason
+            except Exception as e:
+                logger.error(f"O'Neil sell rule error, using legacy rules: {e}")
+
+        # ── 레거시 안전망 (O'Neil 모듈 불가/예외 시에만) ─────────
         try:
             ticker = stock_data.get('ticker', '')
             buy_price = stock_data.get('buy_price', 0)
@@ -935,13 +1099,19 @@ class StockTrackingAgent:
             logger.error(f"{stock_data.get('ticker', '') if 'ticker' in locals() else 'Unknown stock'} Error analyzing sell: {str(e)}")
             return False, "Analysis error"
 
-    async def sell_stock(self, stock_data: Dict[str, Any], sell_reason: str) -> bool:
+    async def sell_stock(self, stock_data: Dict[str, Any], sell_reason: str,
+                         exit_kind: Optional[str] = None) -> bool:
         """
         Stock sell processing
 
         Args:
             stock_data: Stock information to sell
             sell_reason: Sell reason
+            exit_kind: Optional explicit exit classification (stop | trend_exit |
+                target | ai). Loops pass it deterministically (loop_a=stop,
+                loop_b=trend_exit); when None it is inferred from sell_reason. Stored
+                in trading_history so the re-entry cooldown treats a stop-out at a
+                marginal profit as churn-risk.
 
         Returns:
             bool: Sell success status
@@ -958,6 +1128,30 @@ class StockTrackingAgent:
             account_key = stock_data.get('account_key') or self._account_scope()[0]
             account_name = stock_data.get('account_name') or self._account_scope()[1]
 
+            # ── Cross-cycle sell guard (single source of truth) ──────────────
+            # EVERY sell path routes its real order + signal publish through
+            # sell_stock and gates on this bool return: the batch update_holdings,
+            # loop_a_hardstop, and loop_b_trend_exit (KR + US). A concurrent cycle
+            # may have already closed this position seconds/minutes ago, so refresh
+            # the connection snapshot (commit ends any stale WAL read-txn so other
+            # processes' commits are visible) and abort if the row is gone — no
+            # trading_history row, no delete, no journal, no queued message — so the
+            # caller publishes NO duplicate/ghost SELL and P&L is not double-counted.
+            # Incident 2026-07-01 (MU): loop_a stop-sold 23:50 (+published SELL),
+            # the batch re-hit the same stop off a stale snapshot and re-published a
+            # 2nd SELL 23:55. sell_stock is the chokepoint that closes this for all
+            # paths in both markets.
+            self.conn.commit()
+            if get_existing_position_for_ticker(
+                self.cursor, ticker, account_key=account_key
+            ).get("row_count", 0) == 0:
+                logger.warning(
+                    f"[SELL-GUARD][KR] {ticker}({company_name}) already closed by "
+                    f"another cycle — sell_stock aborting (no duplicate record/signal)"
+                )
+                return False
+            # ─────────────────────────────────────────────────────────────────
+
             # Calculate profit rate
             profit_rate = ((current_price - buy_price) / buy_price) * 100
 
@@ -969,12 +1163,19 @@ class StockTrackingAgent:
             # Current time
             now = now_datetime.strftime("%Y-%m-%d %H:%M:%S")
 
+            # Classify the exit (stop/trend_exit/target/ai) for the churn guard.
+            try:
+                from reentry_cooldown import classify_exit_kind
+                _exit_kind = classify_exit_kind(sell_reason, exit_kind)
+            except Exception:
+                _exit_kind = exit_kind  # fail-open: store caller hint or None
+
             # Add to trading history table
             self.cursor.execute(
                 """
                 INSERT INTO trading_history
-                (account_key, account_name, ticker, company_name, buy_price, buy_date, sell_price, sell_date, profit_rate, holding_days, scenario, trigger_type, trigger_mode, sector)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (account_key, account_name, ticker, company_name, buy_price, buy_date, sell_price, sell_date, profit_rate, holding_days, scenario, trigger_type, trigger_mode, sector, exit_kind)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     account_key,
@@ -991,14 +1192,27 @@ class StockTrackingAgent:
                     trigger_type,
                     trigger_mode,
                     stock_data.get('sector'),
+                    _exit_kind,
                 )
             )
 
-            # Remove from holdings
-            self.cursor.execute(
-                "DELETE FROM stock_holdings WHERE ticker = ? AND account_key = ?",
-                (ticker, account_key)
-            )
+            # Remove from holdings.
+            # Pyramiding (#288): when the row carries an id AND the ticker has more
+            # than one row for this account, delete ONLY that row so the remaining
+            # independent entries are preserved. Single-row tickers keep the legacy
+            # ticker-scoped delete (zero behavior change).
+            row_id = stock_data.get('id')
+            existing = get_existing_position_for_ticker(self.cursor, ticker, account_key=account_key)
+            if row_id is not None and existing.get("row_count", 0) > 1:
+                self.cursor.execute(
+                    "DELETE FROM stock_holdings WHERE id = ?",
+                    (row_id,)
+                )
+            else:
+                self.cursor.execute(
+                    "DELETE FROM stock_holdings WHERE ticker = ? AND account_key = ?",
+                    (ticker, account_key)
+                )
 
             # Save changes
             self.conn.commit()
@@ -1148,9 +1362,15 @@ class StockTrackingAgent:
         try:
             logger.info("Starting holdings info update")
 
+            # 매도 판단에 쓸 '현재' 시장 레짐을 사이클당 1회 계산(OpenAI 무관).
+            # _analyze_sell_decision 이 self._live_regime_cache 로 참조한다.
+            self._live_regime_cache = self._get_live_regime_safe()
+
             # Query holdings list
+            # id included for pyramiding (#288): enables per-row delete and
+            # fractional-sell quantity computation for multi-row tickers.
             self.cursor.execute(
-                """SELECT ticker, company_name, buy_price, buy_date, current_price,
+                """SELECT id, ticker, company_name, buy_price, buy_date, current_price,
                    scenario, target_price, stop_loss, last_updated,
                    trigger_type, trigger_mode, account_key, account_name, sector
                    FROM stock_holdings
@@ -1164,6 +1384,30 @@ class StockTrackingAgent:
                 return []
 
             sold_stocks = []
+
+            # 이벤트 강제청산 자동탐지: 사이클당 1회 KIS 종목상태코드 일괄 prefetch.
+            # (관리종목/투자위험/거래정지 자동 포착 → _analyze_sell_decision의 TIER0.)
+            # 실패해도 override 경로는 독립 동작하므로 빈 dict로 안전 폴백.
+            kis_status_map: Dict[str, str] = {}
+            try:
+                from cores.corporate_status import fetch_status_codes
+                kis_status_map = await fetch_status_codes(
+                    [h.get("ticker") for h in holdings],
+                    account_name=holdings[0].get("account_name") if holdings else None,
+                )
+            except Exception as e:
+                logger.warning(f"KIS status prefetch skipped: {e}")
+
+            # Pyramiding (#288) FIX 2 — in-pass over-sell guard:
+            # When several rows of the SAME ticker sell within one update pass,
+            # limit/reserved orders may not have filled yet, so re-reading the
+            # broker quantity each iteration would see the full (un-decremented)
+            # quantity and over-sell. Instead we snapshot the ticker's total
+            # broker quantity ONCE (first sell of that ticker this pass) and
+            # distribute from the snapshot using an in-pass accumulator —
+            # independent of fill timing.
+            pass_total_qty: Dict[str, int] = {}   # ticker -> snapshot total qty
+            pass_sold_qty: Dict[str, int] = {}    # ticker -> cumulative ordered qty
 
             for stock in holdings:
                 ticker = stock.get('ticker')
@@ -1179,6 +1423,9 @@ class StockTrackingAgent:
 
                 # Update stock price information
                 stock['current_price'] = current_price
+
+                # 이벤트 자동탐지용 KIS 종목상태코드 주입(TIER0가 _analyze_sell_decision에서 사용)
+                stock['_kis_stat_code'] = kis_status_map.get(ticker)
 
                 # Check scenario JSON string
                 scenario_str = stock.get('scenario', '{}')
@@ -1202,15 +1449,51 @@ class StockTrackingAgent:
                 should_sell, sell_reason = await self._analyze_sell_decision(stock)
 
                 if should_sell:
-                    # Process sell
+                    # Pyramiding (#288): compute remaining row count N for this
+                    # (ticker, account) BEFORE the DB row is deleted by sell_stock.
+                    # N>1 => fractional KIS sell (floor(total/N)); N==1 => sell all
+                    # (unchanged). Recomputed live each sell so the last row sweeps.
+                    remaining_rows = get_existing_position_for_ticker(
+                        self.cursor, ticker, account_key=stock.get("account_key")
+                    ).get("row_count", 1)
+
+                    # Process sell (deletes only this row when N>1, else the ticker)
                     sell_success = await self.sell_stock(stock, sell_reason)
 
                     if sell_success:
                         # Call actual account trading function (async)
                         from trading.domestic_stock_trading import AsyncTradingContext
                         async with AsyncTradingContext(account_name=stock.get("account_name")) as trading:
+                            # Determine fractional sell quantity for multi-row tickers.
+                            # FIX 2: snapshot total qty once per ticker per pass and
+                            # distribute from (snapshot - already_ordered), so fills
+                            # that haven't settled yet cannot cause an over-sell.
+                            sell_quantity = None
+                            # Multi-row tickers sell fractionally. The FINAL row of a
+                            # ticker already split THIS pass (remaining_rows==1 but
+                            # ticker in pass_total_qty) must also sell from the snapshot
+                            # remainder (available), NOT re-query the broker — otherwise,
+                            # if the earlier limit orders are still unfilled, get_holding_quantity
+                            # returns the full position and the last row over-sells (#288 FIX 2).
+                            # Genuinely single-row tickers (never split) keep quantity=None → sell_all.
+                            if remaining_rows > 1 or ticker in pass_total_qty:
+                                if ticker not in pass_total_qty:
+                                    pass_total_qty[ticker] = await asyncio.to_thread(
+                                        trading.get_holding_quantity, ticker
+                                    )
+                                    pass_sold_qty[ticker] = 0
+                                available = pass_total_qty[ticker] - pass_sold_qty[ticker]
+                                sell_quantity = compute_fractional_sell_quantity(available, remaining_rows)
+                                pass_sold_qty[ticker] += sell_quantity
+                                logger.info(
+                                    f"{ticker} pyramiding fractional sell: {sell_quantity} shares "
+                                    f"(available {available} of snapshot {pass_total_qty[ticker]}, "
+                                    f"remaining rows={remaining_rows})"
+                                )
                             # Execute async sell with limit price for reserved orders
-                            trade_result = await trading.async_sell_stock(stock_code=ticker, limit_price=current_price)
+                            trade_result = await trading.async_sell_stock(
+                                stock_code=ticker, limit_price=current_price, quantity=sell_quantity
+                            )
 
                         if trade_result['success']:
                             logger.info(f"Actual sell successful: {trade_result['message']}")
@@ -1340,7 +1623,7 @@ class StockTrackingAgent:
             sector_counts = {}
 
             if holdings and len(holdings) > 0:
-                message += f"🔸 보유 종목:\n"
+                message += "🔸 보유 종목:\n"
                 for stock in holdings:
                     ticker = stock.get('ticker', '')
                     company_name = stock.get('company_name', '')
@@ -1375,7 +1658,7 @@ class StockTrackingAgent:
                     message += f"  수익률: {arrow} {profit_rate:.2f}% / 보유기간: {days_passed}일\n\n"
 
                 # Add sector distribution
-                message += f"🔸 섹터 분포:\n"
+                message += "🔸 섹터 분포:\n"
                 for sector, count in sector_counts.items():
                     percentage = (count / len(holdings)) * 100
                     message += f"- {sector}: {count}개 ({percentage:.1f}%)\n"
@@ -1384,7 +1667,7 @@ class StockTrackingAgent:
                 message += "현재 보유 종목이 없습니다.\n\n"
 
             # 3. Trading history statistics
-            message += f"🔸 매매 이력 통계\n"
+            message += "🔸 매매 이력 통계\n"
             message += f"- 총 거래: {total_trades}건\n"
             message += f"- 수익 거래: {successful_trades}건\n"
             message += f"- 손실 거래: {total_trades - successful_trades}건\n"
@@ -1392,7 +1675,7 @@ class StockTrackingAgent:
             if total_trades > 0:
                 message += f"- 승률: {(successful_trades / total_trades * 100):.2f}%\n"
             else:
-                message += f"- 승률: 0.00%\n"
+                message += "- 승률: 0.00%\n"
 
             message += f"- 누적 수익률: {total_profit:.2f}%\n\n"
 
@@ -1496,7 +1779,28 @@ class StockTrackingAgent:
                     min_score = scenario.get("min_score", 0)
                     logger.info(f"Buy score check: {company_name}({ticker}) - Score: {buy_score}")
 
+                    # Re-entry cooldown gate (SHADOW logs only; LIVE vetoes a churn
+                    # re-entry into a name just sold — longer cooldown after a loss).
+                    _cd_block = False
                     if analysis_result.get("decision") == "Enter":
+                        try:
+                            from reentry_cooldown import reentry_block, COOLDOWN_LIVE, COOLDOWN_RISK_EXIT_LIVE
+                            _cd = reentry_block("KR", ticker)
+                        except Exception:
+                            _cd, COOLDOWN_LIVE, COOLDOWN_RISK_EXIT_LIVE = None, False, False
+                        if _cd:
+                            # A stop/trend-exit block that is NOT also a loss is the new
+                            # exit-kind branch -> SHADOW unless COOLDOWN_RISK_EXIT_LIVE.
+                            _risk_only = bool(_cd.get("risk_exit")) and not _cd.get("after_loss")
+                            _enforce = COOLDOWN_LIVE and (COOLDOWN_RISK_EXIT_LIVE or not _risk_only)
+                            logger.warning(
+                                "[REENTRY_COOLDOWN][%s] %s ticker=%s last_sell=%s ret=%.1f%% gap=%.1fh<%sh after_loss=%s exit_kind=%s risk_only=%s",
+                                "LIVE" if _enforce else "SHADOW", _cd["action"], ticker,
+                                _cd["last_sell"], _cd["last_ret"], _cd["gap_hours"],
+                                _cd["window_hours"], _cd["after_loss"], _cd.get("exit_kind"), _risk_only)
+                            _cd_block = _enforce
+
+                    if analysis_result.get("decision") == "Enter" and not _cd_block:
                         buy_success = await self.buy_stock(ticker, company_name, current_price, scenario, rank_change_msg)
 
                         if buy_success:
@@ -1675,10 +1979,20 @@ class StockTrackingAgent:
                 self._msg_types = []
                 return False
 
-            # Generate summary report
-            summary = await self.generate_report_summary()
-            self._msg_types.append("portfolio")
-            self.message_queue.append(summary)
+            # Generate summary report — de-duplicated so near-simultaneous run-ends
+            # (KR batch + intraday loops A/B) don't emit 2-3 identical portfolio
+            # summaries. Other queued messages (sell notices) are unaffected.
+            try:
+                from portfolio_broadcast import should_send_portfolio
+                _emit_portfolio = should_send_portfolio("KR")
+            except Exception:
+                _emit_portfolio = True  # fail-open
+            if _emit_portfolio:
+                summary = await self.generate_report_summary()
+                self._msg_types.append("portfolio")
+                self.message_queue.append(summary)
+            else:
+                logger.info("[portfolio-dedup] KR portfolio summary skipped (sent within debounce window)")
 
             # Translate messages if English is requested
             if language == "en":
@@ -1688,7 +2002,7 @@ class StockTrackingAgent:
                     translated_queue = []
                     for idx, message in enumerate(self.message_queue, 1):
                         logger.info(f"Translating message {idx}/{len(self.message_queue)}")
-                        translated = await translate_telegram_message(message, model="gpt-5-nano")
+                        translated = await translate_telegram_message(message, model="gpt-5.4-nano")
                         translated_queue.append(translated)
                     self.message_queue = translated_queue
                     logger.info("All messages translated successfully")
@@ -1794,7 +2108,7 @@ class StockTrackingAgent:
                             logger.info(f"Translating tracking message to {lang}")
                             translated_message = await translate_telegram_message(
                                 message,
-                                model="gpt-5-nano",
+                                model="gpt-5.4-nano",
                                 from_lang="ko",
                                 to_lang=lang
                             )

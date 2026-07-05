@@ -63,6 +63,71 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def _log_journal_influence_stats(cursor, table: str = "trading_history", days: int = 90) -> None:
+    """Measure whether journal-influenced buys outperformed non-influenced ones (#280).
+
+    Reads completed trades, inspects the persisted buy-scenario JSON for
+    ``journal_reflection.referenced`` / ``score_adjustment``, and logs comparative
+    outcomes. Purely observational — never mutates data. A trade counts as
+    "influenced" when the buy decision recorded that journal context materially
+    informed it (referenced=true) or an experience-based score adjustment was applied.
+    """
+    try:
+        cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+        cursor.execute(
+            f"SELECT scenario, profit_rate FROM {table} WHERE sell_date >= ?",
+            (cutoff,),
+        )
+        rows = cursor.fetchall()
+    except Exception as e:
+        logger.warning(f"Journal influence stats query failed ({table}): {e}")
+        return
+
+    influenced, non_influenced = [], []
+    for row in rows:
+        try:
+            profit = float(row["profit_rate"])
+        except (TypeError, ValueError, KeyError, IndexError):
+            continue
+        scenario_raw = None
+        try:
+            scenario_raw = row["scenario"]
+        except (KeyError, IndexError):
+            pass
+        is_influenced = False
+        if scenario_raw:
+            try:
+                sc = json.loads(scenario_raw) if isinstance(scenario_raw, str) else scenario_raw
+                if isinstance(sc, dict):
+                    jr = sc.get("journal_reflection") or {}
+                    sadj = sc.get("score_adjustment") or {}
+                    if (isinstance(jr, dict) and jr.get("referenced")) or \
+                       (isinstance(sadj, dict) and sadj.get("value")):
+                        is_influenced = True
+            except Exception:
+                pass
+        (influenced if is_influenced else non_influenced).append(profit)
+
+    def _avg(xs):
+        return sum(xs) / len(xs) if xs else 0.0
+
+    def _winrate(xs):
+        return (sum(1 for x in xs if x > 0) / len(xs) * 100) if xs else 0.0
+
+    logger.info(f"\n📒 Journal Influence on Outcomes (last {days} days, {table}):")
+    logger.info(
+        f"  Influenced buys : {len(influenced):3d} | avg {_avg(influenced):+.2f}% | win {_winrate(influenced):.0f}%"
+    )
+    logger.info(
+        f"  Non-influenced  : {len(non_influenced):3d} | avg {_avg(non_influenced):+.2f}% | win {_winrate(non_influenced):.0f}%"
+    )
+    if not influenced:
+        logger.info(
+            "  (journal_reflection is recorded only on trades opened after this feature shipped — "
+            "the influenced bucket fills in as new trades close)"
+        )
+
+
 async def run_compression(
     db_path: str = "stock_tracking_db.sqlite",
     layer1_age_days: int = 7,
@@ -142,7 +207,7 @@ async def run_compression(
         """, (cutoff_layer2,))
         layer2_count = agent.cursor.fetchone()[0]
 
-        logger.info(f"\n📦 Entries to Compress:")
+        logger.info("\n📦 Entries to Compress:")
         logger.info(f"  Layer 1 → 2: {layer1_count} entries (older than {layer1_age_days} days)")
         logger.info(f"  Layer 2 → 3: {layer2_count} entries (older than {layer2_age_days} days)")
 
@@ -173,6 +238,15 @@ async def run_compression(
                     "layer2_to_layer3": layer2_count
                 }
             }
+
+        # 누적 코퍼스 기반 직관 재추출(#intuition-stall): 압축 skip 여부와 무관하게 항상 실행.
+        # (압축은 신규 항목이 없으면 skip 되지만, 직관은 최근 누적 저널에서 매 실행 갱신돼야 함)
+        try:
+            refresh = await agent.compression_manager.refresh_intuitions()
+            logger.info(f"💡 Intuitions Refreshed (corpus): generated={refresh.get('intuitions_generated', 0)} "
+                        f"corpus={refresh.get('corpus', 0)} extracted={refresh.get('extracted', 0)}")
+        except Exception as _re:
+            logger.warning(f"Intuition refresh skipped: {_re}")
 
         # Check minimum entries requirement
         effective_min = 1 if force else min_entries
@@ -260,11 +334,16 @@ async def run_compression(
             agent.cursor.execute("SELECT COUNT(*) FROM trading_intuitions WHERE is_active = 1")
             active_intuitions = agent.cursor.fetchone()[0]
 
-            logger.info(f"\n📊 Final Active Counts:")
+            logger.info("\n📊 Final Active Counts:")
             logger.info(f"  Active Principles: {active_principles}")
             logger.info(f"  Active Intuitions: {active_intuitions}")
         else:
             logger.info("\n⏭️  Cleanup skipped (--skip-cleanup)")
+
+        # Observability: did journal-grounded decisions actually lead to better outcomes? (#280)
+        # Both KR and US trades live in the same SQLite db, so report each table.
+        _log_journal_influence_stats(agent.cursor, table="trading_history")
+        _log_journal_influence_stats(agent.cursor, table="us_trading_history")
 
         agent.conn.close()
 
@@ -281,6 +360,138 @@ async def run_compression(
         import traceback
         traceback.print_exc()
         return {"status": "error", "error": str(e)}
+
+
+def _load_us_compression_manager():
+    """Load USCompressionManager directly from prism-us/tracking/compression.py.
+
+    Loaded via importlib from the file path so we bypass prism-us/tracking/__init__.py
+    (which imports db_schema/journal and would risk the documented KR/US 'cores'
+    shadowing when run from the root context). compression.py itself only depends on
+    the stdlib, so a standalone file load is safe.
+    """
+    import importlib.util
+
+    comp_path = Path(__file__).parent / "prism-us" / "tracking" / "compression.py"
+    spec = importlib.util.spec_from_file_location("us_compression_standalone", comp_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.USCompressionManager
+
+
+async def run_us_compression(
+    db_path: str = "stock_tracking_db.sqlite",
+    layer1_age_days: int = 7,
+    layer2_age_days: int = 30,
+    min_entries: int = 3,
+    dry_run: bool = False,
+    force: bool = False,
+    skip_cleanup: bool = False,
+    max_principles: int = 50,
+    max_intuitions: int = 50,
+    stale_days: int = 90,
+    archive_layer3_days: int = 365,
+) -> dict:
+    """Run US-market compression/cleanup on the same shared SQLite database.
+
+    US trades live in the same DB as KR (distinguished by the ``market`` column),
+    but the weekly job previously only ran the KR ``StockTrackingAgent`` pass, so US
+    intuitions were never derived from compression. This decoupled pass runs the
+    standalone ``USCompressionManager`` (deterministic, no LLM) over its own
+    connection, independent of the KR control flow.
+    """
+    import sqlite3
+
+    logger.info("=" * 60)
+    logger.info("US Trading Memory Compression Started")
+    logger.info(f"Database: {db_path}")
+    logger.info("=" * 60)
+
+    try:
+        USCompressionManager = _load_us_compression_manager()
+    except Exception as e:
+        logger.error(f"Could not load USCompressionManager (skipping US pass): {e}")
+        return {"status": "error", "error": f"load failed: {e}"}
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    try:
+        manager = USCompressionManager(cursor, conn)
+
+        stats_before = manager.get_compression_stats()
+        layers = stats_before.get("entries_by_layer", {})
+        logger.info("\n📊 US Current Status:")
+        logger.info(f"  Layer 1 (Detailed): {layers.get('layer1_detailed', 0)}")
+        logger.info(f"  Layer 2 (Summarized): {layers.get('layer2_summarized', 0)}")
+        logger.info(f"  Layer 3 (Compressed): {layers.get('layer3_compressed', 0)}")
+        logger.info(f"  Active Intuitions: {stats_before.get('active_intuitions', 0)}")
+        logger.info(f"  Active Principles: {stats_before.get('active_principles', 0)}")
+
+        if dry_run:
+            logger.info("\n🔍 US DRY RUN - showing cleanup preview only (compression not simulated)")
+            cleanup_preview = manager.cleanup_stale_data(
+                max_principles=max_principles,
+                max_intuitions=max_intuitions,
+                stale_days=stale_days,
+                archive_layer3_days=archive_layer3_days,
+                dry_run=True,
+            )
+            return {
+                "status": "dry_run",
+                "stats_before": stats_before,
+                "cleanup_preview": cleanup_preview,
+            }
+
+        effective_min = 1 if force else min_entries
+
+        logger.info("\n🔄 Running US compression...")
+        results = await manager.compress_old_journal_entries(
+            layer1_age_days=layer1_age_days,
+            layer2_age_days=layer2_age_days,
+            min_entries_for_compression=effective_min,
+        )
+        logger.info(f"  US Layer 1 → 2: {results['layer1_to_layer2']['compressed']} compressed")
+        logger.info(f"  US Layer 2 → 3: {results['layer2_to_layer3']['compressed']} compressed")
+        logger.info(f"  US Intuitions generated: {results['intuitions_generated']}")
+
+        cleanup_results = {}
+        if not skip_cleanup:
+            logger.info("\n🧹 Running US Cleanup...")
+            cleanup_results = manager.cleanup_stale_data(
+                max_principles=max_principles,
+                max_intuitions=max_intuitions,
+                stale_days=stale_days,
+                archive_layer3_days=archive_layer3_days,
+                dry_run=False,
+            )
+            logger.info(f"  US Principles deactivated: {cleanup_results.get('principles_deactivated', 0)}")
+            logger.info(f"  US Intuitions deactivated: {cleanup_results.get('intuitions_deactivated', 0)}")
+            logger.info(f"  US Journal entries archived: {cleanup_results.get('journal_entries_archived', 0)}")
+        else:
+            logger.info("\n⏭️  US Cleanup skipped (--skip-cleanup)")
+
+        stats_after = manager.get_compression_stats()
+        logger.info("\n📊 US Final Active Counts:")
+        logger.info(f"  Active Intuitions: {stats_after.get('active_intuitions', 0)}")
+        logger.info(f"  Active Principles: {stats_after.get('active_principles', 0)}")
+
+        return {
+            "status": "success",
+            "results": results,
+            "cleanup_results": cleanup_results,
+            "stats_before": stats_before,
+            "stats_after": stats_after,
+        }
+
+    except Exception as e:
+        logger.error(f"US compression failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return {"status": "error", "error": str(e)}
+    finally:
+        conn.close()
 
 
 def main():
@@ -386,15 +597,32 @@ Examples:
         archive_layer3_days=args.archive_days
     ))
 
+    # Run US-market compression/cleanup on the same shared DB (decoupled from KR).
+    # Previously only the KR pass ran, so US intuitions were never derived (#321).
+    us_result = asyncio.run(run_us_compression(
+        db_path=args.db_path,
+        layer1_age_days=args.layer1_age,
+        layer2_age_days=args.layer2_age,
+        min_entries=args.min_entries,
+        dry_run=args.dry_run,
+        force=args.force,
+        skip_cleanup=args.skip_cleanup,
+        max_principles=args.max_principles,
+        max_intuitions=args.max_intuitions,
+        stale_days=args.stale_days,
+        archive_layer3_days=args.archive_days
+    ))
+
     # Print final summary
     logger.info("\n" + "=" * 60)
-    logger.info(f"Final Status: {result.get('status', 'unknown')}")
+    logger.info(f"Final Status (KR): {result.get('status', 'unknown')}")
+    logger.info(f"Final Status (US): {us_result.get('status', 'unknown')}")
     logger.info("=" * 60)
 
-    if result.get('status') == 'error':
+    if result.get('status') == 'error' or us_result.get('status') == 'error':
         sys.exit(1)
 
-    return result
+    return {"kr": result, "us": us_result}
 
 
 if __name__ == "__main__":

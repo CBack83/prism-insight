@@ -5,6 +5,14 @@ from dotenv import load_dotenv
 
 from mcp_agent.app import MCPApp
 
+# Standard logger for the buy-quality SHADOW hook. The function-local `logger`
+# (parallel_app.logger) is an mcp_agent context-bound logger that RAISES when
+# called outside an active logging context — which silently killed the
+# [BUY_QUALITY][SHADOW] verdict logs (swallowed by the hook's except). This
+# plain logger writes to stdout (captured by the cron logs) and never raises.
+import logging as _logging
+_BQ_LOG = _logging.getLogger("prism.buy_quality")
+
 from cores.agents import get_agent_directory
 from cores.report_generation import generate_report, generate_summary, generate_investment_strategy, get_disclaimer, generate_market_report
 
@@ -95,10 +103,10 @@ async def analyze_stock(company_code: str = "000660", company_name: str = "SK하
                         agent = agents[section]
                         if section == "market_index_analysis":
                             if "report" in _market_analysis_cache:
-                                section_logger.info(f"Using cached market analysis")
+                                section_logger.info("Using cached market analysis")
                                 return section, _market_analysis_cache["report"]
                             else:
-                                section_logger.info(f"Generating new market analysis")
+                                section_logger.info("Generating new market analysis")
                                 report = await generate_market_report(agent, section, reference_date, section_logger, language)
                                 _market_analysis_cache["report"] = report
                                 return section, report
@@ -126,10 +134,10 @@ async def analyze_stock(company_code: str = "000660", company_name: str = "SK하
                         if section == "market_index_analysis":
                             # Check if data exists in cache
                             if "report" in _market_analysis_cache:
-                                logger.info(f"Using cached market analysis")
+                                logger.info("Using cached market analysis")
                                 report = _market_analysis_cache["report"]
                             else:
-                                logger.info(f"Generating new market analysis")
+                                logger.info("Generating new market analysis")
                                 report = await generate_market_report(agent, section, reference_date, logger, language)
                                 # Save to cache
                                 _market_analysis_cache["report"] = report
@@ -228,6 +236,100 @@ async def analyze_stock(company_code: str = "000660", company_name: str = "SK하
             market_cap_chart_html = None
             fundamentals_chart_html = None
 
+        # 10b. Render QA (Phase 6 S2) — OFF by default, non-blocking
+        from cores.llm.capabilities import vision_available
+        if vision_available():
+            try:
+                import base64
+                import re
+                import tempfile
+                from cores.llm.features.render_qa import qa_and_log
+                _qa_html = price_chart_html or volume_chart_html
+                if _qa_html:
+                    _m = re.search(r'base64,([^"]+)"', _qa_html)
+                    if _m:
+                        _img_bytes = base64.b64decode(_m.group(1))
+                        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as _tf:
+                            _tf.write(_img_bytes)
+                            _tf_path = _tf.name
+                        await qa_and_log(_tf_path, context_label=f"{company_code}_{company_name}")
+                        import os as _os
+                        _os.unlink(_tf_path)
+            except Exception:
+                pass  # render QA must never affect the pipeline
+
+        # 10c. Buy-quality vision gate (Phase 6 S3) — SHADOW by default, log-only.
+        # Computes a CAN SLIM base analysis + per-regime verdict and LOGS it.
+        # In shadow mode it has ZERO effect on the report or any buy decision.
+        # When PRISM_FEATURE_VISION_IN_REPORT=on, the descriptive base analysis is
+        # ALSO surfaced as a markdown subsection in the technical section below —
+        # a SOFT input the buy agent reads, never a buy gate (that stays S5/TODO).
+        vision_pattern_md = ""
+        if vision_available():
+            try:
+                import base64 as _bq_base64
+                import re as _bq_re
+                from cores.llm.capabilities import vision_shadow, vision_in_report
+                from cores.llm.features.buy_quality import (
+                    analyze_base,
+                    analyze_base_oneil,
+                    format_vision_pattern_md,
+                    gate_verdict,
+                )
+                _bq_html = price_chart_html
+                _bq_regime = (macro_context or {}).get("market_regime", "sideways")
+                _BQ_LOG.info("[BUY_QUALITY][SHADOW] hook reached: code=%s regime=%s",
+                             company_code, _bq_regime)
+                # Phase 6 S3.5: prefer the two-timeframe O'Neil path (daily +
+                # weekly with RS line), which grounds rs_line_new_high and the
+                # weekly base reading. Falls back to the single daily report
+                # image when the two-timeframe generation returns None (e.g.
+                # pykrx/index data unavailable). Still SHADOW/log-only.
+                _bq_analysis = await analyze_base_oneil(
+                    company_code, company_name, regime=_bq_regime
+                )
+                if _bq_analysis is None and _bq_html:
+                    _bq_m = _bq_re.search(r'base64,([^"]+)"', _bq_html)
+                    if _bq_m:
+                        _bq_img = _bq_base64.b64decode(_bq_m.group(1))
+                        _bq_analysis = await analyze_base(_bq_img)
+                if _bq_analysis is not None:
+                    _bq_verdict = gate_verdict(_bq_analysis, _bq_regime)
+                    _BQ_LOG.info(
+                        "[BUY_QUALITY][SHADOW] code=%s regime=%s would_buy=%s "
+                        "qscore=%s thr=%s base=%s",
+                        company_code,
+                        _bq_regime,
+                        _bq_verdict["would_buy"],
+                        _bq_verdict["quality_score"],
+                        _bq_verdict["threshold"],
+                        _bq_analysis.base_type,
+                    )
+                    # Opt-in (PRISM_FEATURE_VISION_IN_REPORT=on): surface the
+                    # descriptive base analysis into the report's technical
+                    # section. SOFT report content the buy agent reads — this is
+                    # NOT the buy gate (that remains the S5/TODO below).
+                    if vision_in_report():
+                        vision_pattern_md = format_vision_pattern_md(
+                            _bq_analysis, language
+                        )
+                    # TODO(S5/LIVE): when not vision_shadow(), inject
+                    # _bq_verdict into the entry matrix (Step 2 of the
+                    # trading_scenario_agent prompt) so it gates real
+                    # buys. Do NOT implement live injection until S4
+                    # backtest passes and the user confirms (S5).
+                    _ = vision_shadow  # referenced to mark the LIVE seam
+                else:
+                    _BQ_LOG.warning(
+                        "[BUY_QUALITY][SHADOW] no analysis for %s "
+                        "(analyze_base_oneil + fallback both None)",
+                        company_code,
+                    )
+            except Exception as _bqe:
+                # Log (do NOT silently swallow) — still never affects pipeline.
+                _BQ_LOG.warning("[BUY_QUALITY][SHADOW] hook failed for %s: %s",
+                                company_code, _bqe, exc_info=True)
+
         # 11. Build macro section (before final report composition)
         macro_section = ""
         if macro_context:
@@ -289,21 +391,21 @@ async def analyze_stock(company_code: str = "000660", company_name: str = "SK하
             main_headers = {
                 "title": f"# {company_name} ({company_code}) 분석 보고서",
                 "pub_date": "발행일",
-                "tech_analysis": f"## 1. 기술적 분석\n\n",
-                "fundamental": f"## 2. 펀더멘털 분석\n\n",
-                "news": f"## 3. 뉴스 분석\n\n",
-                "market": f"## 4. 시장 분석\n\n",
-                "strategy": f"## 5. 투자 전략\n\n"
+                "tech_analysis": "## 1. 기술적 분석\n\n",
+                "fundamental": "## 2. 펀더멘털 분석\n\n",
+                "news": "## 3. 뉴스 분석\n\n",
+                "market": "## 4. 시장 분석\n\n",
+                "strategy": "## 5. 투자 전략\n\n"
             }
         else:
             main_headers = {
                 "title": f"# {company_name} ({company_code}) Analysis Report",
                 "pub_date": "Publication Date",
-                "tech_analysis": f"## 1. Technical Analysis\n\n",
-                "fundamental": f"## 2. Fundamental Analysis\n\n",
-                "news": f"## 3. News Analysis\n\n",
-                "market": f"## 4. Market Analysis\n\n",
-                "strategy": f"## 5. Investment Strategy\n\n"
+                "tech_analysis": "## 1. Technical Analysis\n\n",
+                "fundamental": "## 2. Fundamental Analysis\n\n",
+                "news": "## 3. News Analysis\n\n",
+                "market": "## 4. Market Analysis\n\n",
+                "strategy": "## 5. Investment Strategy\n\n"
             }
 
         # Build final report with title first (disclaimer at the end like US version)
@@ -323,6 +425,11 @@ async def analyze_stock(company_code: str = "000660", company_name: str = "SK하
             final_report += main_headers["tech_analysis"]
             if "price_volume_analysis" in section_reports:
                 final_report += section_reports["price_volume_analysis"] + "\n\n"
+                # Vision chart-pattern analysis (opt-in; empty unless
+                # PRISM_FEATURE_VISION_IN_REPORT=on). Placed right after the
+                # price/volume prose and before the chart images.
+                if vision_pattern_md:
+                    final_report += vision_pattern_md
                 # Add price and volume charts
                 if price_chart_html or volume_chart_html:
                     chart_title = "### 가격 및 거래량 차트\n\n" if language == "ko" else "### Price and Volume Charts\n\n"

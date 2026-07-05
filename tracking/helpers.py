@@ -59,28 +59,42 @@ async def get_current_stock_price(cursor, ticker: str, account_key: str | None =
     Returns:
         float: Current stock price
     """
-    try:
-        from krx_data_client import get_nearest_business_day_in_a_week, get_market_ohlcv_by_ticker
-        import datetime
+    import asyncio
+    from krx_data_client import get_nearest_business_day_in_a_week, get_market_ohlcv_by_ticker
+    import datetime
 
-        today = datetime.datetime.now().strftime("%Y%m%d")
-        trade_date = get_nearest_business_day_in_a_week(today, prev=True)
-        logger.info(f"Target date: {trade_date}")
+    # KRX API (data.krx.co.kr) can intermittently time out. Retry the transient
+    # fetch a few times before falling back, so a momentary blip does not silently
+    # drop a fresh buy candidate (its price is not yet in the DB, so the last-price
+    # fallback returns 0 and the whole report analysis is skipped). #289-adjacent.
+    MAX_RETRIES = 3
+    for attempt in range(MAX_RETRIES):
+        try:
+            today = datetime.datetime.now().strftime("%Y%m%d")
+            trade_date = get_nearest_business_day_in_a_week(today, prev=True)
+            logger.info(f"Target date: {trade_date}")
 
-        df = get_market_ohlcv_by_ticker(trade_date)
+            df = get_market_ohlcv_by_ticker(trade_date)
 
-        if ticker in df.index:
-            current_price = df.loc[ticker, "Close"]
-            logger.info(f"{ticker} current price: {current_price:,.0f} KRW")
-            return float(current_price)
-        else:
-            logger.warning(f"Cannot find ticker {ticker}")
-            return _get_last_price_from_db(cursor, ticker, account_key=account_key)
+            if ticker in df.index:
+                current_price = df.loc[ticker, "Close"]
+                logger.info(f"{ticker} current price: {current_price:,.0f} KRW")
+                return float(current_price)
+            else:
+                # Data fetched OK but ticker absent — retrying won't help.
+                logger.warning(f"Cannot find ticker {ticker}")
+                return _get_last_price_from_db(cursor, ticker, account_key=account_key)
 
-    except Exception as e:
-        logger.error(f"Error querying current price for {ticker}: {str(e)}")
-        logger.error(traceback.format_exc())
-        return _get_last_price_from_db(cursor, ticker, account_key=account_key)
+        except Exception as e:
+            logger.error(f"Error querying current price for {ticker} "
+                         f"(attempt {attempt + 1}/{MAX_RETRIES}): {str(e)}")
+            if attempt < MAX_RETRIES - 1:
+                wait = 2 * (attempt + 1)  # 2s, 4s exponential-ish backoff
+                logger.warning(f"{ticker} price query retry in {wait}s")
+                await asyncio.sleep(wait)
+            else:
+                logger.error(traceback.format_exc())
+                return _get_last_price_from_db(cursor, ticker, account_key=account_key)
 
 
 def _get_last_price_from_db(cursor, ticker: str, account_key: str | None = None) -> float:
@@ -217,6 +231,161 @@ def get_current_slots_count(cursor, account_key: str | None = None) -> int:
     except Exception as e:
         logger.error(f"Error querying holdings count: {str(e)}")
         return 0
+
+
+# ── Pyramiding (#288) ──────────────────────────────────────────────────────
+# Strong-bull add-on / pyramiding helpers. Each pyramid entry is an independent
+# stock_holdings row. The gate below decides whether the "already holding" block
+# may be bypassed for an additional entry.
+
+# Market regimes in which pyramiding (adding to a winning position) is allowed.
+PYRAMID_ALLOWED_REGIMES = ("strong_bull", "parabolic")
+# Minimum aggregate profit (%) of the existing position to allow an add.
+PYRAMID_MIN_PROFIT_PCT = 5.0
+# Maximum number of rows (entries) per ticker/account (initial + up to 2 adds).
+PYRAMID_MAX_ROWS = 3
+# Table name for holdings (overridable for US: "us_stock_holdings").
+_HOLDINGS_TABLE = "stock_holdings"
+
+
+def get_existing_position_for_ticker(
+    cursor,
+    ticker: str,
+    account_key: str | None = None,
+    table_name: str = _HOLDINGS_TABLE,
+) -> Dict[str, Any]:
+    """Aggregate the existing holding for a ticker/account.
+
+    Returns a dict with:
+        row_count: number of existing rows for (ticker, account)
+        avg_buy_price: simple average buy_price across those rows (0 if none)
+    Used by the pyramiding add-gate.
+
+    NOTE (#288, intentional): ``avg_buy_price`` is a SIMPLE MEAN of per-row entry
+    prices, NOT a share-weighted average. The independent-row model deliberately
+    stores no per-row quantity in ``stock_holdings``, and each add is ~1 unit, so
+    the simple mean is an accurate-enough proxy for both the +5% profit gate and
+    the Telegram "누적 평단" display.
+    """
+    try:
+        if account_key:
+            cursor.execute(
+                f"SELECT buy_price FROM {table_name} WHERE ticker = ? AND account_key = ?",
+                (ticker, account_key),
+            )
+        else:
+            cursor.execute(
+                f"SELECT buy_price FROM {table_name} WHERE ticker = ?",
+                (ticker,),
+            )
+        prices = [float(r[0]) for r in cursor.fetchall() if r[0] is not None]
+        row_count = len(prices)
+        avg_buy_price = (sum(prices) / row_count) if row_count else 0.0
+        return {"row_count": row_count, "avg_buy_price": avg_buy_price}
+    except Exception as e:
+        logger.error(f"Error querying existing position for {ticker}: {str(e)}")
+        return {"row_count": 0, "avg_buy_price": 0.0}
+
+
+def _regime_label(market_condition: str | None) -> str:
+    """Extract the leading regime label from a market_condition string.
+
+    Real values look like ``"strong_bull: 보고서 기준 KOSPI가 20일선 상회..."`` —
+    the regime token (with underscore) comes before the first ':'. We take the
+    substring before the first ':', normalise it, and canonicalise separators so
+    a hyphen/space variant ("strong-bull"/"strong bull") maps to "strong_bull".
+    Fail-closed: anything unrecognised returns "" (no add).
+    """
+    if not market_condition or not isinstance(market_condition, str):
+        return ""
+    # Take the regime token before the first ':' (rest is the human description).
+    text = market_condition.split(":", 1)[0].strip().lower()
+    # Canonicalise separators: hyphen/space -> underscore (e.g. "strong-bull").
+    text = text.replace("-", "_").replace(" ", "_")
+    return text
+
+
+def pyramid_add_possible_ignoring_regime(
+    existing_avg_buy_price: float,
+    current_price: float,
+    existing_row_count: int,
+    min_profit_pct: float = PYRAMID_MIN_PROFIT_PCT,
+    max_rows: int = PYRAMID_MAX_ROWS,
+) -> Tuple[bool, str]:
+    """Regime-independent necessary conditions for a pyramiding add (#288).
+
+    These are exactly conditions (2) row-count and (3) aggregate-profit of
+    ``evaluate_pyramid_add_gate`` — the parts that need NO LLM output (computed
+    from the DB position + current price only). If this returns False, the full
+    gate can never allow an add regardless of regime, so a held stock can be
+    skipped BEFORE its per-stock scenario LLM runs, with the same end result.
+    Single source of truth: ``evaluate_pyramid_add_gate`` delegates here.
+    """
+    if existing_row_count >= max_rows:
+        return False, f"row count {existing_row_count} >= max {max_rows}"
+
+    if not existing_avg_buy_price or existing_avg_buy_price <= 0 or not current_price or current_price <= 0:
+        return False, "insufficient price data for profit check"
+
+    profit_pct = (current_price - existing_avg_buy_price) / existing_avg_buy_price * 100.0
+    if profit_pct < min_profit_pct:
+        return False, f"profit {profit_pct:.2f}% < required {min_profit_pct:.1f}%"
+
+    return True, f"profit={profit_pct:.2f}%, rows={existing_row_count}"
+
+
+def evaluate_pyramid_add_gate(
+    market_condition: str | None,
+    existing_avg_buy_price: float,
+    current_price: float,
+    existing_row_count: int,
+    min_profit_pct: float = PYRAMID_MIN_PROFIT_PCT,
+    max_rows: int = PYRAMID_MAX_ROWS,
+) -> Tuple[bool, str]:
+    """Pure add-gate for pyramiding (#288).
+
+    Returns (allowed, reason). All of the following must hold to allow:
+      1) regime in PYRAMID_ALLOWED_REGIMES (parsed from market_condition prefix)
+      2) existing aggregate position profit >= min_profit_pct
+      3) existing_row_count < max_rows
+
+    Does NOT include the buy-agent Enter/score/sector checks — those are applied
+    independently by the normal buy path.
+    """
+    regime = _regime_label(market_condition)
+    if regime not in PYRAMID_ALLOWED_REGIMES:
+        return False, f"regime '{regime or 'unknown'}' not in {PYRAMID_ALLOWED_REGIMES}"
+
+    # Conditions (2) and (3) are regime-independent — delegate so the cheap
+    # pre-gate that skips the scenario LLM stays in lock-step with this gate.
+    ok, reason = pyramid_add_possible_ignoring_regime(
+        existing_avg_buy_price, current_price, existing_row_count, min_profit_pct, max_rows
+    )
+    if not ok:
+        return False, reason
+
+    return True, f"add allowed (regime={regime}, {reason})"
+
+
+def compute_fractional_sell_quantity(total_quantity: int, remaining_rows: int) -> int:
+    """Shares to sell for one row when ``remaining_rows`` rows remain (#288).
+
+    - remaining_rows <= 1  -> sell all (total_quantity)  [zero regression for non-pyramided]
+    - remaining_rows >  1  -> floor(total_quantity / remaining_rows)
+
+    Recomputed live at each sell so the LAST remaining row always sweeps the
+    remainder (since it sees remaining_rows == 1 and sells everything left).
+    """
+    try:
+        total = int(total_quantity)
+        n = int(remaining_rows)
+    except (TypeError, ValueError):
+        return int(total_quantity) if total_quantity else 0
+    if total <= 0:
+        return 0
+    if n <= 1:
+        return total
+    return total // n
 
 
 # Apply ratio guard only when portfolio is large enough that the ratio is meaningful.

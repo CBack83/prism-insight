@@ -236,11 +236,11 @@ class StockAnalysisOrchestrator:
                     img_num = match.group(1)
                     # Look for common translation patterns (both HTML and markdown)
                     patterns = [
-                        rf'<img\s+[^>]*>',  # HTML img tag (translated or not)
-                        rf'\[Image[^\]]*\]',  # [Image: ...]
-                        rf'!\[[^\]]*\]\([^\)]*\)',  # ![alt](url) that's not base64
-                        rf'\[图片[^\]]*\]',  # Chinese: [图片...]
-                        rf'\[画像[^\]]*\]',  # Japanese: [画像...]
+                        r'<img\s+[^>]*>',  # HTML img tag (translated or not)
+                        r'\[Image[^\]]*\]',  # [Image: ...]
+                        r'!\[[^\]]*\]\([^\)]*\)',  # ![alt](url) that's not base64
+                        r'\[图片[^\]]*\]',  # Chinese: [图片...]
+                        r'\[画像[^\]]*\]',  # Japanese: [画像...]
                     ]
 
                     replaced = False
@@ -592,7 +592,7 @@ class StockAnalysisOrchestrator:
         """
         # Skip if telegram is disabled
         if not self.telegram_config.use_telegram:
-            logger.info(f"Telegram disabled - skipping message and PDF transmission")
+            logger.info("Telegram disabled - skipping message and PDF transmission")
             return
 
         logger.info(f"Starting telegram message transmission for {len(message_paths)} messages")
@@ -643,6 +643,15 @@ class StockAnalysisOrchestrator:
                 # Transmission interval
                 await asyncio.sleep(1)
 
+            # Phase 6 S6: broadcast annotated insight images (default-OFF, non-blocking).
+            # One image per company AFTER its PDF. KR -> market=None (auto
+            # KOSPI/KOSDAQ). Gated on PRISM_FEATURE_INSIGHT_IMAGE; never raises.
+            try:
+                from cores.llm.features.insight_broadcast import broadcast_insight_images
+                await broadcast_insight_images(bot_agent, chat_id, pdf_paths, market=None)
+            except Exception as e:
+                logger.warning(f"[INSIGHT_IMAGE] KR broadcast skipped: {e}")
+
             # Send translated PDFs to broadcast channels asynchronously (non-blocking)
             if self.telegram_config.broadcast_languages and report_paths:
                 self._broadcast_tasks.append(
@@ -670,7 +679,7 @@ class StockAnalysisOrchestrator:
                         logger.info(f"Translating telegram message to {lang}")
                         translated_message = await translate_telegram_message(
                             original_message,
-                            model="gpt-5-nano",
+                            model="gpt-5.4-nano",
                             from_lang="ko",
                             to_lang=lang
                         )
@@ -713,8 +722,9 @@ class StockAnalysisOrchestrator:
         """
         try:
             from cores.agents.telegram_translator_agent import translate_telegram_message
+            from pdf_converter import PdfRenderer
 
-            async def _translate_pdfs_for_lang(lang, channel_id):
+            async def _translate_pdfs_for_lang(lang, channel_id, renderer):
                 for report_path in report_paths:
                     try:
                         logger.info(f"Translating markdown report {report_path} to {lang}")
@@ -727,7 +737,7 @@ class StockAnalysisOrchestrator:
 
                         translated_report = await translate_telegram_message(
                             text_for_translation,
-                            model="gpt-5-nano",
+                            model="gpt-5.4-nano",
                             from_lang="ko",
                             to_lang=lang
                         )
@@ -743,10 +753,12 @@ class StockAnalysisOrchestrator:
 
                         logger.info(f"Translated report saved: {translated_report_path}")
 
-                        translated_pdf_paths = await self.convert_to_pdf([str(translated_report_path)])
+                        translated_pdf_file = PDF_REPORTS_DIR / f"{Path(translated_report_path).stem}.pdf"
+                        translated_pdf_path = await renderer.render(
+                            str(translated_report_path), str(translated_pdf_file)
+                        )
 
-                        if translated_pdf_paths and len(translated_pdf_paths) > 0:
-                            translated_pdf_path = translated_pdf_paths[0]
+                        if translated_pdf_path:
                             logger.info(f"Sending translated PDF {translated_pdf_path} to {lang} channel")
                             success = await bot_agent.send_document(channel_id, str(translated_pdf_path), msg_type="pdf")
 
@@ -766,18 +778,21 @@ class StockAnalysisOrchestrator:
                             await send_openai_quota_alert(self.telegram_config, market="KR")
                             return
 
-            # Process languages sequentially to limit memory usage
-            # (each PDF generation spawns a Playwright/Chromium instance)
-            for lang in self.telegram_config.broadcast_languages:
-                channel_id = self.telegram_config.get_broadcast_channel_id(lang)
-                if not channel_id:
-                    logger.warning(f"No channel ID configured for language: {lang}")
-                    continue
-                logger.info(f"Processing PDF translation for {lang} channel (sequential)")
-                try:
-                    await _translate_pdfs_for_lang(lang, channel_id)
-                except Exception as lang_err:
-                    logger.error(f"PDF translation failed for {lang}: {lang_err}")
+            # Languages are still processed one page at a time (memory ceiling stays
+            # at a single Chromium), but a SHARED browser is reused across all of
+            # them so the Chromium launch cost is paid ONCE instead of once per file
+            # (previously N launches for N PDFs — the batch's main slow tail).
+            async with PdfRenderer() as renderer:
+                for lang in self.telegram_config.broadcast_languages:
+                    channel_id = self.telegram_config.get_broadcast_channel_id(lang)
+                    if not channel_id:
+                        logger.warning(f"No channel ID configured for language: {lang}")
+                        continue
+                    logger.info(f"Processing PDF translation for {lang} channel (shared browser)")
+                    try:
+                        await _translate_pdfs_for_lang(lang, channel_id, renderer)
+                    except Exception as lang_err:
+                        logger.error(f"PDF translation failed for {lang}: {lang_err}")
 
         except Exception as e:
             logger.error(f"Error in _send_translated_pdfs: {str(e)}")
@@ -815,7 +830,7 @@ class StockAnalysisOrchestrator:
                     all_results[key] = value
 
             if not all_results:
-                logger.warning(f"No trigger results found.")
+                logger.warning("No trigger results found.")
                 return False
 
             # Include metadata for hybrid selection info in alert message
@@ -829,7 +844,7 @@ class StockAnalysisOrchestrator:
                 try:
                     logger.info("Translating trigger alert message to English")
                     from cores.agents.telegram_translator_agent import translate_telegram_message
-                    message = await translate_telegram_message(message, model="gpt-5-nano")
+                    message = await translate_telegram_message(message, model="gpt-5.4-nano")
                     logger.info("Translation complete")
                 except Exception as e:
                     logger.error(f"Translation failed: {str(e)}. Using original Korean message.")
@@ -888,7 +903,7 @@ class StockAnalysisOrchestrator:
                     logger.info(f"Translating trigger alert to {lang}")
                     translated_message = await translate_telegram_message(
                         original_message,
-                        model="gpt-5-nano",
+                        model="gpt-5.4-nano",
                         from_lang="ko",
                         to_lang=lang
                     )

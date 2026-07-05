@@ -41,7 +41,7 @@ from report_generator import (
 from tracking.user_memory import UserMemoryManager
 from firecrawl_client import firecrawl_agent
 from cores.disclaimer_utils import strip_trailing_disclaimer as _strip_trailing_disclaimer
-from datetime import datetime, timedelta
+from datetime import timedelta
 from dataclasses import dataclass
 from typing import Dict, Optional
 
@@ -636,24 +636,11 @@ class TelegramAIBot:
 
     def check_daily_limit(self, user_id: int, command: str) -> bool:
         """
-        Check daily usage limit.
+        Daily usage limit for report/us_report — removed (issue #307).
 
-        Args:
-            user_id: User ID
-            command: Command (report, us_report)
-
-        Returns:
-            bool: True if available, False if already used
+        Always returns True (unlimited). Kept as a no-op so existing call
+        sites and refund_daily_limit() stay valid without further changes.
         """
-        today = datetime.now().strftime("%Y-%m-%d")
-        key = f"{user_id}:{command}"
-
-        if self.daily_report_usage.get(key) == today:
-            logger.info(f"Daily limit exceeded: user={user_id}, command={command}")
-            return False
-
-        self.daily_report_usage[key] = today
-        logger.info(f"Daily usage recorded: user={user_id}, command={command}")
         return True
 
     def refund_daily_limit(self, user_id: int, command: str):
@@ -782,6 +769,12 @@ class TelegramAIBot:
         self.application.add_handler(MessageHandler(
             filters.REPLY & filters.TEXT & ~filters.COMMAND,
             self.handle_reply_to_evaluation
+        ), group=1)
+
+        # Photo handler - analyze attached images (e.g. chart screenshots) via vision LLM
+        self.application.add_handler(MessageHandler(
+            filters.PHOTO & ~filters.COMMAND,
+            self.handle_photo
         ), group=1)
 
         # Report command handler
@@ -947,7 +940,7 @@ class TelegramAIBot:
         # ==========================================================================
         # Firecrawl AI Research commands — interactive ConversationHandlers
         # Each command first asks for the required parameter, then calls Firecrawl.
-        # Subsequent replies to the bot's response continue via Anthropic Sonnet 4.6.
+        # Subsequent replies to the bot's response continue via Anthropic Sonnet 5.
         # BotFather commands to register:
         #   signal - 이벤트/뉴스 임팩트 분석 (한국)
         #   us_signal - 이벤트/뉴스 임팩트 분석 (미국)
@@ -1036,6 +1029,219 @@ class TelegramAIBot:
         # Error handler
         self.application.add_error_handler(self.handle_error)
     
+    async def handle_photo(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Analyze a chart image sent as a reply to an ongoing bot conversation.
+
+        Reply-only: the photo must reply to a bot message that still carries a
+        conversation context (journal / firecrawl / insight / evaluation). A
+        summary of that context is folded into the vision prompt and the context
+        is re-registered on the sent reply so the thread continues. A context-less
+        photo gets a short usage hint instead (bare photos never reach the bot in
+        group chats under Telegram privacy mode). Rate-limited per user.
+        """
+        if not update.message or not update.message.photo:
+            return
+
+        user_id = update.effective_user.id if update.effective_user else 0
+
+        # --- Context-aware reply detection ---------------------------------
+        # When this photo is a reply to a prior bot message that still carries
+        # a conversation context, fold a short summary of that context into the
+        # vision prompt and re-register the same context on the sent reply so
+        # the user can keep the thread going (mirrors the text-reply handlers).
+        # A photo message has a caption (not .text) so it never reaches
+        # handle_reply_to_evaluation (filters.TEXT) — no handler conflict.
+        reply_msg = update.message.reply_to_message
+        replied_to_msg_id = reply_msg.message_id if reply_msg else None
+        context_block = None   # FULL prior-conversation text to prepend, or None
+        reregister = None      # (store_dict, context_obj) to re-register, or None
+        ctx_kind = None        # 'eval'|'firecrawl'|'insight'|'journal' — for history recording
+        ctx_obj = None         # the live context object (to append the image turn to)
+
+        if replied_to_msg_id is not None:
+            # 1. journal_contexts — plain dict, created_at-based 30min expiry
+            if replied_to_msg_id in self.journal_contexts:
+                jctx = self.journal_contexts[replied_to_msg_id]
+                created_at = jctx.get('created_at')
+                if created_at and (datetime.now() - created_at).total_seconds() > 1800:
+                    await update.message.reply_text(
+                        "이전 대화 세션이 만료되었습니다.\n"
+                        "/journal 명령어로 새로운 대화를 시작해주세요. 💭"
+                    )
+                    del self.journal_contexts[replied_to_msg_id]
+                    return
+                t_name = jctx.get('ticker_name') or ''
+                t_code = jctx.get('ticker') or ''
+                context_block = f"매매일지 종목: {t_name} ({t_code})".strip()
+                reregister = (self.journal_contexts, jctx)
+                ctx_kind, ctx_obj = 'journal', jctx
+
+            # 2. firecrawl_contexts — FirecrawlConversationContext, 24h expiry
+            elif replied_to_msg_id in self.firecrawl_contexts:
+                fctx = self.firecrawl_contexts[replied_to_msg_id]
+                if fctx.is_expired():
+                    await update.message.reply_text(
+                        "이전 리서치 세션이 만료되었습니다. 명령어를 다시 입력해주세요."
+                    )
+                    del self.firecrawl_contexts[replied_to_msg_id]
+                    return
+                # Full research thread (command + query + every prior Q/A)
+                try:
+                    context_block = fctx.get_context_summary()
+                except Exception:
+                    context_block = f"이전 리서치 명령어: /{getattr(fctx, 'command', '')}, 질의: {getattr(fctx, 'query', '')}".strip()
+                reregister = (self.firecrawl_contexts, fctx)
+                ctx_kind, ctx_obj = 'firecrawl', fctx
+
+            # 2.5 insight_contexts — InsightConversationContext, 30min expiry
+            elif replied_to_msg_id in self.insight_contexts:
+                ictx = self.insight_contexts[replied_to_msg_id]
+                if ictx.is_expired():
+                    await update.message.reply_text(
+                        "이전 /insight 세션이 만료되었습니다. /insight로 새로 시작해주세요."
+                    )
+                    del self.insight_contexts[replied_to_msg_id]
+                    return
+                # Build the full insight thread (original question + every prior turn)
+                lines = [f"초기 질문: {getattr(ictx, 'original_question', '') or ''}", "", "대화 내역:"]
+                for turn in getattr(ictx, 'conversation_history', []) or []:
+                    lines.append(f"\n사용자 질문: {turn.get('q', '')}")
+                    lines.append(f"AI 답변: {turn.get('a', '')}")
+                context_block = "\n".join(lines)
+                reregister = (self.insight_contexts, ictx)
+                ctx_kind, ctx_obj = 'insight', ictx
+
+            # 3. conversation_contexts — ConversationContext (report/eval), 24h expiry
+            elif replied_to_msg_id in self.conversation_contexts:
+                cctx = self.conversation_contexts[replied_to_msg_id]
+                if cctx.is_expired():
+                    if getattr(cctx, 'market_type', 'kr') == "us":
+                        await update.message.reply_text(
+                            "이전 대화 세션이 만료되었습니다. 새로운 평가를 시작하려면 /us_evaluate 명령어를 사용해주세요."
+                        )
+                    else:
+                        await update.message.reply_text(
+                            "이전 대화 세션이 만료되었습니다. 새로운 평가를 시작하려면 /evaluate 명령어를 사용해주세요."
+                        )
+                    del self.conversation_contexts[replied_to_msg_id]
+                    return
+                # Full evaluation context: ticker, price, holding, TONE (피드백 스타일),
+                # trade background, AND the entire prior conversation history.
+                try:
+                    context_block = cctx.get_context_for_llm()
+                except Exception:
+                    t_name = getattr(cctx, 'ticker_name', '') or ''
+                    t_code = getattr(cctx, 'ticker', '') or ''
+                    market_label = "미국" if getattr(cctx, 'market_type', 'kr') == "us" else "한국"
+                    context_block = f"평가 종목: {t_name} ({t_code}), 시장: {market_label}"
+                reregister = (self.conversation_contexts, cctx)
+                ctx_kind, ctx_obj = 'eval', cctx
+
+        # Reply-only: a bare photo (no active bot-conversation context) is not a
+        # supported entry point. In group chats Telegram privacy mode never even
+        # delivers such messages to the bot; in DMs it would, but analyzing a
+        # context-less image is not the intended flow. Guide the user instead.
+        if reregister is None:
+            await update.message.reply_text(
+                "📈 차트 이미지 분석은 봇과의 대화에 이어서 사용해주세요.\n"
+                "먼저 /evaluate · /report · /signal · /insight 등으로 대화를 시작한 뒤, "
+                "봇 답변에 차트 이미지로 답장하시면 그 맥락에 맞춰 분석해 드립니다."
+            )
+            return
+
+        # Rate limit (shared daily-count bucket, same cap as signal/theme commands)
+        allowed, remaining = self.check_daily_limit_count(user_id, "chart", max_count=10)
+        if not allowed:
+            await update.message.reply_text(
+                "오늘 이미지 분석 사용 한도(10회)를 모두 사용하셨습니다. 내일 다시 시도해주세요."
+            )
+            return
+
+        try:
+            # Largest resolution is the last entry in the PhotoSize list
+            photo = update.message.photo[-1]
+            tg_file = await photo.get_file()
+            image_bytes = bytes(await tg_file.download_as_bytearray())
+        except Exception as exc:
+            logger.error(f"[CHART] image download failed: {exc}")
+            self.refund_daily_limit_count(user_id, "chart")
+            await update.message.reply_text("이미지를 받지 못했습니다. 다시 보내주세요.")
+            return
+
+        caption = (update.message.caption or "").strip()
+
+        prompt = (
+            "당신은 주식 차트를 읽는 전문 트레이더입니다. 첨부된 이미지를 분석해 "
+            "한국어로 설명하세요.\n"
+            "- 이미지가 주식/코인 차트라면: 추세(상승/하락/횡보), 주요 지지·저항 구간, "
+            "거래량 특징, 눈에 띄는 캔들/패턴, 그리고 유의할 리스크를 짚어주세요.\n"
+            "- 차트가 아니라면: 이미지에 무엇이 보이는지 간단히 설명하세요.\n"
+            "확정적 매수·매도 지시는 하지 말고, 관찰과 시나리오 위주로 서술하세요. "
+            "종목명이나 가격이 이미지에서 불명확하면 추측하지 말고 그렇게 밝히세요."
+        )
+        # Prepend the FULL prior conversation so the vision model continues the
+        # thread — same tone/voice, aware of everything said so far. analyze_image
+        # is text-prompt + image, so multi-turn is emulated by injecting this block.
+        if context_block:
+            prompt = (
+                "아래는 사용자와 나눈 지금까지의 대화입니다. 여기에 '피드백 스타일'이 "
+                "있으면 그 말투를, 없으면 직전 대화의 어투를 그대로 유지하세요.\n"
+                "===== 이전 대화 =====\n"
+                f"{context_block}\n"
+                "====================\n\n"
+                "사용자가 위 대화에 이어서 아래 차트 이미지를 첨부했습니다. 새로 시작하는 "
+                "설명이 아니라, 지금까지의 대화를 이어받아 같은 종목·맥락·말투로 자연스럽게 "
+                "답변하세요. 이전에 이미 말한 내용은 반복하지 말고 차트에서 새로 보이는 "
+                "점 위주로 짚어주세요.\n\n"
+                + prompt
+            )
+        if caption:
+            prompt += f"\n\n[사용자 메모] {caption}"
+
+        try:
+            await update.message.chat.send_action(action="typing")
+        except Exception:
+            pass
+
+        # analyze_image never raises: returns None on error / when vision is off
+        from cores.llm.features.vision import analyze_image
+
+        result = await analyze_image(image_bytes, prompt)
+
+        if not result:
+            self.refund_daily_limit_count(user_id, "chart")
+            await update.message.reply_text(
+                "이미지 분석 기능을 사용할 수 없습니다. (비전 모델 비활성화 또는 일시적 오류)"
+            )
+            return
+
+        text = str(result).strip()
+
+        # Record this image turn into the conversation history so subsequent
+        # replies (text or photo) remember what the chart analysis said — the
+        # same mechanism the text-reply handlers use to keep the thread coherent.
+        user_turn = "[차트 이미지 첨부]" + (f" {caption}" if caption else "")
+        try:
+            if ctx_kind in ('eval', 'firecrawl') and ctx_obj is not None:
+                ctx_obj.add_to_history("user", user_turn)
+                ctx_obj.add_to_history("assistant", text)
+            elif ctx_kind == 'insight' and ctx_obj is not None:
+                ctx_obj.add_turn(user_turn, text, None)
+            # journal_contexts is a plain dict with no history — nothing to record
+        except Exception as exc:
+            logger.warning(f"[CHART] history record skipped: {exc}")
+
+        # Telegram hard limit is 4096 chars per message — chunk safely
+        sent_message = None
+        for i in range(0, len(text), 4000):
+            sent_message = await update.message.reply_text(text[i:i + 4000])
+
+        # Re-register the context on the sent reply so a follow-up reply (text or
+        # photo) continues the same thread, mirroring the text-reply handlers.
+        if reregister and sent_message is not None:
+            store, obj = reregister
+            store[sent_message.message_id] = obj
+
     async def handle_reply_to_evaluation(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle replies to evaluation responses"""
         if not update.message or not update.message.reply_to_message:
@@ -1304,6 +1510,9 @@ class TelegramAIBot:
             "/ask [질문] - AI에게 투자 관련 자유 질문 (일 3회)\n"
             "  예: <code>/ask 코스피 17년래 최강 상승 다음주도 오를까?</code>\n"
             "  예: <code>/ask 워렌 버핏이 올해 뭘 샀어?</code>\n\n"
+            "🖼️ <b>차트 이미지 분석 (일 10회):</b>\n"
+            "차트 스크린샷을 그냥 사진으로 보내면 AI가 추세·지지/저항·거래량·리스크를 분석해 드립니다.\n"
+            "  • 사진에 캡션을 달면 참고 정보로 활용됩니다\n\n"
             "<b>보유 종목 평가 방법 (한국/미국 동일):</b>\n"
             "1. /evaluate 또는 /us_evaluate 명령어 입력\n"
             "2. 종목 코드/티커 입력 (예: 005930 또는 AAPL)\n"
@@ -1365,12 +1574,12 @@ class TelegramAIBot:
             # Statistics by ticker
             by_ticker = stats.get('by_ticker', {})
             if by_ticker:
-                msg_parts.append(f"\n🏷️ <b>종목별 기록:</b>")
+                msg_parts.append("\n🏷️ <b>종목별 기록:</b>")
                 for ticker, count in list(by_ticker.items())[:5]:
                     msg_parts.append(f"  • {ticker}: {count}개")
 
             # Recent memory details
-            msg_parts.append(f"\n\n📜 <b>최근 기억 (최대 10개):</b>\n")
+            msg_parts.append("\n\n📜 <b>최근 기억 (최대 10개):</b>\n")
             for i, mem in enumerate(memories[:10], 1):
                 created = mem.get('created_at', '')[:10]
                 mem_type = mem.get('memory_type', '')
@@ -1708,8 +1917,8 @@ class TelegramAIBot:
             context.user_data['avg_price'] = avg_price
 
             await update.message.reply_text(
-                f"보유 기간을 입력해주세요. (월 단위)\n"
-                f"예: 6 (6개월)"
+                "보유 기간을 입력해주세요. (월 단위)\n"
+                "예: 6 (6개월)"
             )
             return ENTERING_PERIOD
 
@@ -1969,7 +2178,7 @@ class TelegramAIBot:
                          f"Unicode: {[ord(c) for c in stock_input]}")
 
         # Partial stock name match search
-        logger.info(f"Starting partial match search")
+        logger.info("Starting partial match search")
         possible_matches = []
 
         try:
@@ -2136,8 +2345,8 @@ class TelegramAIBot:
             context.user_data['us_avg_price'] = avg_price
 
             await update.message.reply_text(
-                f"보유 기간을 입력해주세요. (월 단위)\n"
-                f"예: 6 (6개월)"
+                "보유 기간을 입력해주세요. (월 단위)\n"
+                "예: 6 (6개월)"
             )
             return US_ENTERING_PERIOD
 
@@ -2642,21 +2851,76 @@ class TelegramAIBot:
     # gh #263: strip LLM-emitted disclaimer block before appending our canonical one.
     _strip_trailing_disclaimer = staticmethod(_strip_trailing_disclaimer)
 
-    async def _run_firecrawl_command(self, update: Update, prompt: str, disclaimer: str):
+    # Grounding directive appended to every Firecrawl agent (Spark) prompt.
+    # Forces the agent to actually scrape the live web and cite sources rather than
+    # answering from its own parametric knowledge — verified to make spark-1-mini
+    # emit source URLs instead of ungrounded text.
+    _FIRECRAWL_GROUNDING = (
+        "\n\n반드시 웹을 검색하고 실제 뉴스/기사 페이지를 스크랩하여 각 주장에 출처 URL을 명시하라. "
+        "너의 사전지식이 아니라 오늘 기준 최신 웹 데이터에 근거하라."
+    )
+
+    # Firecrawl Spark(/AGENT) jobs can hang server-side in IN_PROGRESS or FAIL
+    # without returning, which would otherwise block the executor thread until the
+    # 300s ConversationHandler timeout. Cap the wait and fall back to search+Claude.
+    _FIRECRAWL_AGENT_TIMEOUT = 120  # seconds
+
+    async def _run_firecrawl_command(self, update: Update, prompt: str, disclaimer: str,
+                                     model: str = "spark-1-mini", max_credits: int = 200,
+                                     fallback_search_query: str = None,
+                                     fallback_analysis_prompt: str = None,
+                                     timeout: int = None):
         """
         Common helper for Firecrawl-based commands.
         Sends a waiting message, calls firecrawl_agent, then replaces it with the result.
+
+        Args:
+            model: Spark agent model — "spark-1-mini" (default) or "spark-1-pro".
+            max_credits: Per-call credit ceiling passed to the agent.
+            fallback_search_query: When set together with fallback_analysis_prompt,
+                a Firecrawl Spark timeout/failure/empty result triggers a search+Claude
+                fallback (generate_firecrawl_search_response) instead of erroring out.
+            fallback_analysis_prompt: Analysis instruction passed to the Claude fallback.
+            timeout: Seconds to wait for the Spark agent before giving up (defaults to
+                _FIRECRAWL_AGENT_TIMEOUT). Heavy spark-1-pro jobs need a larger budget so
+                legitimate deep-research runs are not cut off prematurely.
 
         Returns:
             tuple: (success: bool, response_text: str | None, sent_msg_id: int | None)
         """
         chat_id = update.effective_chat.id
+        agent_timeout = timeout or self._FIRECRAWL_AGENT_TIMEOUT
         waiting_msg = await update.message.reply_text("🔍 리서치 중...")
 
         try:
-            result = await asyncio.get_event_loop().run_in_executor(
-                None, lambda: firecrawl_agent(prompt, max_credits=200, model="spark-1-mini")
-            )
+            try:
+                result = await asyncio.wait_for(
+                    asyncio.get_event_loop().run_in_executor(
+                        None, lambda: firecrawl_agent(prompt, max_credits=max_credits, model=model)
+                    ),
+                    timeout=agent_timeout,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"Firecrawl agent timed out after {agent_timeout}s "
+                    f"(model={model}) — Spark job likely stuck server-side"
+                )
+                result = None
+
+            # Fallback: Spark hung/failed/returned empty — retry via search+Claude (Anthropic).
+            if not result and fallback_search_query and fallback_analysis_prompt:
+                logger.info("Falling back to search+Claude after Firecrawl agent miss")
+                try:
+                    await waiting_msg.edit_text("🔍 리서치 중... (보조 엔진 전환)")
+                except Exception:
+                    pass
+                try:
+                    result = await generate_firecrawl_search_response(
+                        fallback_search_query, fallback_analysis_prompt
+                    )
+                except Exception as fe:
+                    logger.error(f"Search+Claude fallback failed: {fe}", exc_info=True)
+                    result = None
 
             # Delete waiting message
             try:
@@ -2704,7 +2968,7 @@ class TelegramAIBot:
 
     async def _run_search_and_claude(self, update: Update, search_query: str, analysis_prompt: str, disclaimer: str):
         """
-        Cost-efficient helper using Firecrawl /search (2 credits) + Claude Sonnet 4.6.
+        Cost-efficient helper using Firecrawl /search (2 credits) + Claude Sonnet 5.
         Uses the same global MCPApp + AnthropicAugmentedLLM pattern as /evaluate.
 
         Returns:
@@ -2788,17 +3052,18 @@ class TelegramAIBot:
         event = update.message.text.strip()[:200]
         today = datetime.now().strftime("%Y년 %m월")
         logger.info(f"/signal query - user={user_id}, event='{event[:50]}'")
-        search_query = f"{event} 한국증시 영향 {today}"
-        analysis_prompt = (
-            f"위 검색 결과를 바탕으로, '{event}'가 한국 주식시장에 미치는 영향을 분석해줘.\n"
+        prompt = (
+            f"오늘은 {today} 기준입니다. '최근/현재'는 이 시점으로 해석하세요.\n"
+            f"'{event}'가 한국 주식시장에 미치는 영향을 분석해줘.\n"
             "1. 수혜 예상 섹터와 대표 종목 3개\n"
             "2. 피해 예상 섹터와 대표 종목 3개\n"
             "3. 과거 유사 사례\n"
             "4. 개인투자자 대응 전략\n"
             "텔레그램 메시지 형태로 이모지 포함하여 작성. 3000자 이내."
-        )
-        success, response_text, msg_id = await self._run_search_and_claude(
-            update, search_query, analysis_prompt, self._DISCLAIMER_KR
+        ) + self._FIRECRAWL_GROUNDING
+        success, response_text, msg_id = await self._run_firecrawl_command(
+            update, prompt, self._DISCLAIMER_KR, model="spark-1-mini",
+            fallback_search_query=event, fallback_analysis_prompt=prompt
         )
         if success and msg_id and response_text:
             ctx = FirecrawlConversationContext("signal", event)
@@ -2837,17 +3102,18 @@ class TelegramAIBot:
         event = update.message.text.strip()[:200]
         today = datetime.now().strftime("%Y %B")
         logger.info(f"/us_signal query - user={user_id}, event='{event[:50]}'")
-        search_query = f"{event} stock market impact {today}"
-        analysis_prompt = (
-            f"위 검색 결과를 바탕으로, '{event}'가 미국 주식시장(S&P500, NASDAQ)에 미치는 영향을 분석해줘.\n"
-            "1. 수혜 예상 섹터와 대표 종목 3개 (가능하면 yfinance로 최근 주가 흐름 포함)\n"
-            "2. 피해 예상 섹터와 대표 종목 3개 (가능하면 yfinance로 최근 주가 흐름 포함)\n"
+        prompt = (
+            f"오늘은 {today} 기준입니다. '최근/현재'는 이 시점으로 해석하세요.\n"
+            f"'{event}'가 미국 주식시장(S&P500, NASDAQ)에 미치는 영향을 분석해줘.\n"
+            "1. 수혜 예상 섹터와 대표 종목 3개 (최근 주가 흐름 포함)\n"
+            "2. 피해 예상 섹터와 대표 종목 3개 (최근 주가 흐름 포함)\n"
             "3. 과거 유사 사례\n"
             "4. 개인투자자 대응 전략\n"
             "한국어로, 텔레그램 메시지 형태로 이모지 포함하여 작성. 3000자 이내."
-        )
-        success, response_text, msg_id = await self._run_search_and_claude(
-            update, search_query, analysis_prompt, self._DISCLAIMER_KR
+        ) + self._FIRECRAWL_GROUNDING
+        success, response_text, msg_id = await self._run_firecrawl_command(
+            update, prompt, self._DISCLAIMER_KR, model="spark-1-mini",
+            fallback_search_query=event, fallback_analysis_prompt=prompt
         )
         if success and msg_id and response_text:
             ctx = FirecrawlConversationContext("us_signal", event)
@@ -2886,18 +3152,19 @@ class TelegramAIBot:
         theme = update.message.text.strip()[:200]
         today = datetime.now().strftime("%Y년 %m월")
         logger.info(f"/theme query - user={user_id}, theme='{theme[:50]}'")
-        search_query = f"{theme} 테마주 뉴스 {today}"
-        analysis_prompt = (
-            f"위 검색 결과를 바탕으로, 한국 주식시장에서 '{theme}' 테마의 현재 건강도를 진단해줘.\n"
+        prompt = (
+            f"오늘은 {today} 기준입니다. '최근/현재'는 이 시점으로 해석하세요.\n"
+            f"한국 주식시장에서 '{theme}' 테마의 현재 건강도를 진단해줘.\n"
             "1. 테마 온도 (🟢과열/🟡적정/🔴냉각 중 택1, 근거 포함)\n"
             "2. 대장주 3개와 최근 주가 동향\n"
             "3. 긍정 요인 3개\n"
             "4. 부정 요인 3개\n"
             "5. 진입 타이밍 의견\n"
             "텔레그램 메시지 형태로 이모지 포함하여 작성. 3000자 이내."
-        )
-        success, response_text, msg_id = await self._run_search_and_claude(
-            update, search_query, analysis_prompt, self._DISCLAIMER_KR
+        ) + self._FIRECRAWL_GROUNDING
+        success, response_text, msg_id = await self._run_firecrawl_command(
+            update, prompt, self._DISCLAIMER_KR, model="spark-1-mini",
+            fallback_search_query=theme, fallback_analysis_prompt=prompt
         )
         if success and msg_id and response_text:
             ctx = FirecrawlConversationContext("theme", theme)
@@ -2936,18 +3203,19 @@ class TelegramAIBot:
         theme = update.message.text.strip()[:200]
         today = datetime.now().strftime("%Y %B")
         logger.info(f"/us_theme query - user={user_id}, theme='{theme[:50]}'")
-        search_query = f"{theme} sector stocks news {today}"
-        analysis_prompt = (
-            f"위 검색 결과를 바탕으로, 미국 주식시장(S&P500, NASDAQ)에서 '{theme}' 테마의 현재 건강도를 진단해줘.\n"
+        prompt = (
+            f"오늘은 {today} 기준입니다. '최근/현재'는 이 시점으로 해석하세요.\n"
+            f"미국 주식시장(S&P500, NASDAQ)에서 '{theme}' 테마의 현재 건강도를 진단해줘.\n"
             "1. 테마 온도 (🟢과열/🟡적정/🔴냉각 중 택1, 근거 포함)\n"
-            "2. 대장주 3개와 최근 주가 동향 (yfinance 실시간 데이터 기반)\n"
+            "2. 대장주 3개와 최근 주가 동향\n"
             "3. 긍정 요인 3개\n"
             "4. 부정 요인 3개\n"
             "5. 진입 타이밍 의견\n"
             "한국어로, 텔레그램 메시지 형태로 이모지 포함하여 작성. 3000자 이내."
-        )
-        success, response_text, msg_id = await self._run_search_and_claude(
-            update, search_query, analysis_prompt, self._DISCLAIMER_KR
+        ) + self._FIRECRAWL_GROUNDING
+        success, response_text, msg_id = await self._run_firecrawl_command(
+            update, prompt, self._DISCLAIMER_KR, model="spark-1-mini",
+            fallback_search_query=theme, fallback_analysis_prompt=prompt
         )
         if success and msg_id and response_text:
             ctx = FirecrawlConversationContext("us_theme", theme)
@@ -2996,8 +3264,11 @@ class TelegramAIBot:
             f"오늘은 {today}입니다. 다음 투자 관련 질문에 대해 최신 정보를 기반으로 답변해줘:\n\n"
             f"{question}\n\n"
             "한국어로, 텔레그램 메시지 형태로 이모지 포함하여 작성. 3000자 이내."
+        ) + self._FIRECRAWL_GROUNDING
+        success, response_text, msg_id = await self._run_firecrawl_command(
+            update, prompt, self._DISCLAIMER_KR, model="spark-1-pro", max_credits=2000,
+            fallback_search_query=question, fallback_analysis_prompt=prompt, timeout=240
         )
-        success, response_text, msg_id = await self._run_firecrawl_command(update, prompt, self._DISCLAIMER_KR)
         if success:
             if remaining > 0:
                 await update.message.reply_text(f"📊 오늘 남은 /ask 횟수: {remaining}회")
@@ -3373,7 +3644,7 @@ class TelegramAIBot:
     # ==========================================================================
 
     async def _handle_firecrawl_reply(self, update: Update, fc_ctx: FirecrawlConversationContext):
-        """Handle a reply to a Firecrawl bot message — continue via Anthropic Sonnet 4.6."""
+        """Handle a reply to a Firecrawl bot message — continue via Anthropic Sonnet 5."""
         user_question = update.message.text.strip()
         chat_id = update.effective_chat.id
 

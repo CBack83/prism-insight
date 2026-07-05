@@ -18,6 +18,13 @@ _MODEL_MAP: dict[str, str] = {
     "gpt-3.5-turbo": "gpt-5.4-mini",
     "o4-mini": "gpt-5.4-mini",
     "o3-mini": "gpt-5.4-mini",
+    # nano-tier models are rejected by the Codex/ChatGPT-account endpoint
+    # ("model is not supported when using Codex with a ChatGPT account").
+    # Map them to the lightest Codex-compatible model so OAuth-mode callers
+    # (telegram_translator, dashboards, weekly intelligence) keep working.
+    # API-key mode bypasses this proxy, so it uses the real nano model.
+    "gpt-5.4-nano": "gpt-5.4-mini",   # current nano default (2026-03)
+    "gpt-5-nano": "gpt-5.4-mini",     # back-compat (older nano, still live)
 }
 
 
@@ -26,12 +33,60 @@ def _map_model(model: str) -> str:
     return _MODEL_MAP.get(model, model)
 
 
+def prepare_responses_passthrough(body: dict) -> dict:
+    """Prepare a Responses API request for passthrough to the Codex backend.
+
+    The openai-agents Runner already produces a Responses-shaped body (with
+    ``input``, ``instructions``, ``tools`` flat, ``text.format``, etc.), so
+    this function must NOT re-translate the payload.  It only:
+
+    - Maps the model name via ``_map_model`` (e.g. gpt-4o -> gpt-5.4-mini).
+    - Forces ``store=False`` and ``stream=True`` (mandatory for Codex backend).
+    - Injects a default ``instructions`` value when the caller omitted it
+      (Codex requires the field to be present and non-empty).
+
+    All other Responses API fields (``input``, ``tools``, ``tool_choice``,
+    ``text``, ``reasoning``, ``max_output_tokens``, ``temperature``,
+    ``top_p``) are left untouched.
+
+    Does not mutate the caller's dict.
+    """
+    out = dict(body)
+    out["model"] = _map_model(body.get("model", "gpt-5.4-mini"))
+    out["store"] = False   # MANDATORY: store:true returns 400
+    out["stream"] = True   # MANDATORY: always stream upstream
+    if not out.get("instructions"):
+        out["instructions"] = "You are a helpful assistant."
+    # Codex backend requires `input` to be a LIST of items; the openai SDK may
+    # send a bare string for simple text input -> normalize to a user message.
+    inp = out.get("input")
+    if isinstance(inp, str):
+        out["input"] = [{"role": "user", "content": inp}]
+    # The Codex backend rejects several Responses parameters the openai-agents
+    # Runner adds by default (observed: "Unsupported parameter: max_output_tokens").
+    # Strip them so subscription requests succeed.
+    #
+    # previous_response_id: rejected by the Codex/ChatGPT-account endpoint
+    # ("Unsupported parameter: previous_response_id"), which broke multi-turn
+    # tool-calling agents (e.g. the gpt-5.5 trading-scenario / buy decision ->
+    # 400 -> default_scenario -> No Entry). It is also non-functional here:
+    # store=False is forced above, so there is no server-side response to
+    # reference. The full conversation is already carried in `input` (mcp_agent
+    # sends the entire message history every turn), so dropping it is lossless.
+    for unsupported in ("max_output_tokens", "include", "previous_response_id"):
+        out.pop(unsupported, None)
+    # Drop empty tool list (Codex dislikes an empty `tools: []`).
+    if out.get("tools") == []:
+        out.pop("tools", None)
+    return out
+
+
 def translate_request(body: dict) -> dict:
     """Translate Chat Completions request to Responses API format.
 
     Key mappings:
     - messages -> input (with role translations)
-    - max_tokens -> max_output_tokens
+    - max_tokens -> omitted (Codex ChatGPT backend rejects max_output_tokens)
     - tools[].function.* -> tools[].* (flattened)
     - response_format -> text.format
     """
@@ -58,9 +113,8 @@ def translate_request(body: dict) -> dict:
     if reasoning_effort and reasoning_effort != "none":
         translated["reasoning"] = {"effort": reasoning_effort}
 
-    # max_tokens -> max_output_tokens
-    if "max_tokens" in body:
-        translated["max_output_tokens"] = body["max_tokens"]
+    # The ChatGPT Codex backend rejects max_output_tokens, so intentionally
+    # omit Chat Completions max_tokens instead of translating it.
 
     # Tools (flatten nested function structure)
     if body.get("tools"):

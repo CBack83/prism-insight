@@ -226,18 +226,18 @@ def generate_us_report_response_sync(ticker: str, company_name: str) -> str:
 
         # Run US analysis in separate process
         # Uses analyze_us_stock function from prism-us/cores/us_analysis.py
+        # Values are passed via argv (never interpolated into the source string)
+        # so ticker/company_name cannot inject code into the child interpreter.
         cmd = [
             sys.executable,  # 현재 Python 인터프리터
             "-c",
-            f"""
+            """
 import asyncio
 import json
 import sys
 import os
 
-# Use absolute paths (Docker compatibility)
-project_root = r'{project_root}'
-prism_us_dir = r'{prism_us_dir}'
+project_root, prism_us_dir, ticker, company_name = sys.argv[1:5]
 sys.path.insert(0, prism_us_dir)
 os.chdir(project_root)
 
@@ -249,24 +249,28 @@ async def run():
         # Auto-detect last trading day
         ref_date = get_reference_date()
         result = await analyze_us_stock(
-            ticker="{ticker}",
-            company_name="{company_name}",
+            ticker=ticker,
+            company_name=company_name,
             reference_date=ref_date,
             language="ko"
         )
         # Use delimiters to mark start and end of result output
         print("RESULT_START")
-        print(json.dumps({{"success": True, "result": result}}))
+        print(json.dumps({"success": True, "result": result}))
         print("RESULT_END")
     except Exception as e:
         # Use delimiters to mark start and end of error output
         print("RESULT_START")
-        print(json.dumps({{"success": False, "error": str(e)}}))
+        print(json.dumps({"success": False, "error": str(e)}))
         print("RESULT_END")
 
 if __name__ == "__main__":
     asyncio.run(run())
-            """
+            """,
+            project_root,
+            prism_us_dir,
+            ticker,
+            company_name,
         ]
 
         logger.info(f"US external process execution: {ticker} (cwd: {project_root})")
@@ -305,15 +309,15 @@ if __name__ == "__main__":
                 # Check if there's error log in stderr
                 if process.stderr:
                     logger.error(f"US external process error output: {process.stderr[:500]}")
-                return f"US 주식 분석 결과를 찾을 수 없습니다. 로그를 확인하세요."
+                return "US 주식 분석 결과를 찾을 수 없습니다. 로그를 확인하세요."
         except json.JSONDecodeError as e:
             logger.error(f"US 외부 프로세스 출력 파싱 실패: {e}")
             logger.error(f"출력 내용: {output[:1000]}")
-            return f"US 주식 분석 결과 파싱 중 오류가 발생했습니다. 로그를 확인하세요."
+            return "US 주식 분석 결과 파싱 중 오류가 발생했습니다. 로그를 확인하세요."
 
     except subprocess.TimeoutExpired:
         logger.error(f"US 외부 프로세스 타임아웃: {ticker}")
-        return f"US 주식 분석 시간이 초과되었습니다. 다시 시도해주세요."
+        return "US 주식 분석 시간이 초과되었습니다. 다시 시도해주세요."
     except Exception as e:
         logger.error(f"US 동기식 보고서 생성 중 오류: {str(e)}")
         import traceback
@@ -499,15 +503,19 @@ def generate_report_response_sync(stock_code: str, company_name: str) -> str:
 
         # 별도의 프로세스로 분석 수행
         # 이 방법은 새로운 Python 프로세스를 생성하여 분석을 수행하므로 이벤트 루프 충돌 없음
+        # Values are passed via argv (never interpolated into the source string)
+        # so stock_code/company_name cannot inject code into the child interpreter.
         cmd = [
             sys.executable,  # 현재 Python 인터프리터
             "-c",
-            f"""
+            """
 import asyncio
 import json
 import sys
 import logging
 from datetime import datetime
+
+stock_code, company_name, reference_date = sys.argv[1:4]
 
 # subprocess 내부 로깅 설정
 logging.basicConfig(
@@ -516,7 +524,7 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stderr)]
 )
 subprocess_logger = logging.getLogger("subprocess_report")
-subprocess_logger.info("Subprocess 시작: {stock_code} ({company_name})")
+subprocess_logger.info(f"Subprocess 시작: {stock_code} ({company_name})")
 
 from cores.analysis import analyze_stock
 
@@ -524,25 +532,28 @@ async def run():
     try:
         subprocess_logger.info("analyze_stock 호출 시작")
         result = await analyze_stock(
-            company_code="{stock_code}",
-            company_name="{company_name}",
-            reference_date="{reference_date}"
+            company_code=stock_code,
+            company_name=company_name,
+            reference_date=reference_date
         )
-        subprocess_logger.info(f"analyze_stock 완료: {{len(result) if result else 0}} 글자")
+        subprocess_logger.info(f"analyze_stock 완료: {len(result) if result else 0} 글자")
         # 구분자를 사용하여 결과 출력의 시작과 끝을 표시
         print("RESULT_START")
-        print(json.dumps({{"success": True, "result": result}}))
+        print(json.dumps({"success": True, "result": result}))
         print("RESULT_END")
     except Exception as e:
-        subprocess_logger.error(f"analyze_stock 오류: {{str(e)}}", exc_info=True)
+        subprocess_logger.error(f"analyze_stock 오류: {str(e)}", exc_info=True)
         # 구분자를 사용하여 에러 출력의 시작과 끝을 표시
         print("RESULT_START")
-        print(json.dumps({{"success": False, "error": str(e)}}))
+        print(json.dumps({"success": False, "error": str(e)}))
         print("RESULT_END")
 
 if __name__ == "__main__":
     asyncio.run(run())
-            """
+            """,
+            stock_code,
+            company_name,
+            reference_date,
         ]
 
         # Set project root directory (required for cores module import)
@@ -554,7 +565,7 @@ if __name__ == "__main__":
         with open(log_file, "w", encoding="utf-8") as f:
             f.write(f"=== Subprocess Log for {stock_code} ({company_name}) ===\n")
             f.write(f"Started at: {datetime.now().isoformat()}\n")
-            f.write(f"Timeout: 1800 seconds (30 min)\n")
+            f.write("Timeout: 1800 seconds (30 min)\n")
             f.write("=" * 60 + "\n\n")
             f.flush()
 
@@ -724,14 +735,14 @@ async def generate_follow_up_response(ticker, ticker_name, conversation_context,
 
         # 응답 생성
         response = await llm.generate_str(
-            message=f"""사용자의 추가 질문에 대해 답변해주세요.
+            message="""사용자의 추가 질문에 대해 답변해주세요.
                     
                     이전 대화를 참고하되, 사용자의 새 질문에 집중하여 답변하세요.
                     필요한 경우 최신 데이터를 조회하여 정확한 정보를 제공하세요.
                     """,
             request_params=RequestParams(
-                model="claude-sonnet-4-6",
-                maxTokens=2000
+                model="claude-sonnet-5",
+                maxTokens=4000
             )
         )
         app_logger.info(f"추가 질문 응답 생성 결과: {str(response)[:100]}...")
@@ -927,7 +938,7 @@ async def generate_evaluation_response(ticker, ticker_name, avg_price, period, t
                     {report_content if report_content else "관련 보고서가 없습니다. 시장 데이터 조회와 perplexity 검색을 통해 최신 정보를 수집하여 평가해주세요."}
                     """,
             request_params=RequestParams(
-                model="claude-sonnet-4-6",
+                model="claude-sonnet-5",
                 maxTokens=8000
             )
         )
@@ -1124,7 +1135,7 @@ async def generate_us_evaluation_response(ticker, ticker_name, avg_price, period
                     perplexity로 최신 뉴스와 시장 동향을 검색한 후 종합적인 평가를 제공해주세요.
                     """,
             request_params=RequestParams(
-                model="claude-sonnet-4-6",
+                model="claude-sonnet-5",
                 maxTokens=8000
             )
         )
@@ -1215,14 +1226,14 @@ async def generate_us_follow_up_response(ticker, ticker_name, conversation_conte
 
         # Generate response
         response = await llm.generate_str(
-            message=f"""사용자의 추가 질문에 대해 답변해주세요.
+            message="""사용자의 추가 질문에 대해 답변해주세요.
 
                     이전 대화를 참고하되, 사용자의 새 질문에 집중하여 답변하세요.
                     필요한 경우 yahoo_finance를 통해 최신 데이터를 조회하여 정확한 정보를 제공하세요.
                     """,
             request_params=RequestParams(
-                model="claude-sonnet-4-6",
-                maxTokens=2000
+                model="claude-sonnet-5",
+                maxTokens=4000
             )
         )
         app_logger.info(f"US follow-up response generated: {str(response)[:100]}...")
@@ -1339,8 +1350,8 @@ async def generate_journal_conversation_response(
 
 위 메시지에 자연스럽게 응답해주세요. 사용자의 과거 기록(저널, 평가 등)을 참고하여 개인화된 답변을 제공하세요.""",
             request_params=RequestParams(
-                model="claude-sonnet-4-6",
-                maxTokens=2000
+                model="claude-sonnet-5",
+                maxTokens=4000
             )
         )
         app_logger.info(f"Journal conversation response generated: user_id={user_id}, response_len={len(response)}")
@@ -1409,10 +1420,13 @@ async def generate_firecrawl_search_response(search_query: str, analysis_prompt:
         # Step 3: Use global MCPApp + Claude Sonnet for analysis
         app = await get_or_create_global_mcp_app()
 
+        current_date = datetime.now().strftime("%Y년 %m월 %d일")
         agent = Agent(
             name="firecrawl_search_analyst",
             instruction=(
-                "당신은 웹 검색 결과를 분석하여 투자자에게 유용한 인사이트를 제공하는 전문가입니다.\n"
+                f"당신은 웹 검색 결과를 분석하여 투자자에게 유용한 인사이트를 제공하는 전문가입니다.\n"
+                f"오늘은 {current_date}입니다. '최근'·'올해'·'현재' 등은 이 날짜 기준으로 해석하고, "
+                f"모델 학습 시점의 연도로 착각하지 마세요.\n"
                 "텔레그램 메시지 형태로, 이모지를 포함하여 자연스럽게 작성하세요.\n"
                 "마크다운 형식 대신 텔레그램에 적합한 플레인 텍스트로 작성하세요.\n"
                 "검색 결과에 없는 내용을 지어내지 마세요."
@@ -1425,8 +1439,8 @@ async def generate_firecrawl_search_response(search_query: str, analysis_prompt:
         response = await llm.generate_str(
             message=f"다음은 웹 검색 결과입니다:\n\n{context}\n\n---\n\n{analysis_prompt}",
             request_params=RequestParams(
-                model="claude-sonnet-4-6",
-                maxTokens=2000
+                model="claude-sonnet-5",
+                maxTokens=4000
             )
         )
         app.logger.info(f"Firecrawl search+Claude response: {len(response)} chars")
@@ -1447,12 +1461,15 @@ async def generate_firecrawl_search_response(search_query: str, analysis_prompt:
 
 
 # MCP server config per Firecrawl command type
+# "time" gives the followup agent get_current_time so date-ranged tool calls
+# (kospi_kosdaq / yahoo_finance) are anchored to the real year, not the model's
+# training cutoff — otherwise Sonnet queries ~1-year-old data (#283).
 _FIRECRAWL_CMD_SERVERS = {
-    "signal":    ["perplexity", "kospi_kosdaq"],
-    "us_signal": ["perplexity", "yahoo_finance"],
-    "theme":     ["perplexity", "kospi_kosdaq"],
-    "us_theme":  ["perplexity", "yahoo_finance"],
-    "ask":       ["perplexity", "kospi_kosdaq", "yahoo_finance"],
+    "signal":    ["perplexity", "kospi_kosdaq", "time"],
+    "us_signal": ["perplexity", "yahoo_finance", "time"],
+    "theme":     ["perplexity", "kospi_kosdaq", "time"],
+    "us_theme":  ["perplexity", "yahoo_finance", "time"],
+    "ask":       ["perplexity", "kospi_kosdaq", "yahoo_finance", "time"],
 }
 
 _FIRECRAWL_CMD_PERSONA = {
@@ -1488,6 +1505,7 @@ async def generate_firecrawl_followup_response(
         app = await get_or_create_global_mcp_app()
         server_names = _FIRECRAWL_CMD_SERVERS.get(command, ["perplexity"])
         persona = _FIRECRAWL_CMD_PERSONA.get(command, "투자 분석 전문가")
+        current_date = datetime.now().strftime("%Y년 %m월 %d일")
 
         _data_tool_guide = (
             "- 미국 종목 주가·재무·거래량 조회는 yahoo_finance 도구를 우선 사용하세요.\n"
@@ -1499,6 +1517,11 @@ async def generate_firecrawl_followup_response(
         agent = Agent(
             name="firecrawl_followup_agent",
             instruction=f"""당신은 {persona}입니다.
+
+## 현재 날짜 (매우 중요)
+- 오늘은 {current_date}입니다.
+- 주가·거래량 등 기간 기반 도구를 호출할 때는 반드시 위 '오늘' 날짜의 연도를 기준으로 조회하세요. 모델 학습 시점의 연도를 사용하지 마세요.
+- 가능하면 먼저 time 서버의 get_current_time 툴로 현재 날짜를 확인한 뒤, 그 연도를 도구 조회에 사용하세요.
 
 ## 초기 질의
 {query}
@@ -1523,8 +1546,8 @@ async def generate_firecrawl_followup_response(
         response = await llm.generate_str(
             message=user_question,
             request_params=RequestParams(
-                model="claude-sonnet-4-6",
-                maxTokens=2000,
+                model="claude-sonnet-5",
+                maxTokens=4000,
             ),
         )
         app.logger.info(f"firecrawl_followup ({command}): {len(response)} chars")

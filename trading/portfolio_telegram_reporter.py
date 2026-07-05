@@ -43,7 +43,7 @@ from telegram_bot_agent import TelegramBotAgent
 try:
     from us_stock_trading import USStockTrading
     US_TRADING_AVAILABLE = True
-except ImportError as e:
+except ImportError:
     US_TRADING_AVAILABLE = False
 
 # Logging configuration
@@ -69,6 +69,12 @@ class PortfolioTelegramReporter:
     # Season 2 constants
     SEASON2_START_DATE = "2025.09.29"
     SEASON2_START_AMOUNT = 9_969_801  # Starting capital in KRW
+
+    # US account start constants
+    # Funding ran 2026.01.26~2026.03.20 ($1,373.34 -> $10,036 total converted);
+    # simplified to a single start date/amount, consistent with the KR season model.
+    US_START_DATE = "2026.01.20"
+    US_START_AMOUNT = 10_000  # Starting capital in USD
 
     def __init__(self, telegram_token: str = None, chat_id: str = None, trading_mode: str = None, broadcast_languages: list = None):
         """
@@ -99,7 +105,7 @@ class PortfolioTelegramReporter:
         self.trading_mode = trading_mode if trading_mode is not None else _cfg["default_mode"]
         self.telegram_bot = TelegramBotAgent(token=self.telegram_token)
 
-        logger.info(f"PortfolioTelegramReporter initialized")
+        logger.info("PortfolioTelegramReporter initialized")
         logger.info(f"Trading mode: {self.trading_mode} (yaml config: {_cfg['default_mode']})")
 
     def _load_broadcast_channels(self):
@@ -199,7 +205,7 @@ class PortfolioTelegramReporter:
             # Total assets and season profit
             season_profit_emoji = "📈" if season_profit >= 0 else "📉"
 
-            message += f"🇰🇷 *한국주식 계좌*\n"
+            message += "🇰🇷 *한국주식 계좌*\n"
             message += f"💰 총 자산: `{self.format_currency(total_assets)}`\n"
             message += f"{season_profit_emoji} 시즌 수익: `{self.format_currency_with_sign(season_profit)}` "
             message += f"({self.format_percentage(season_profit_rate)})\n"
@@ -214,7 +220,8 @@ class PortfolioTelegramReporter:
 
         # ========== US Account Summary ==========
         if us_portfolio or us_account_summary:
-            message += f"🇺🇸 *미국주식 계좌*\n"
+            message += "🇺🇸 *미국주식 계좌*\n"
+            message += f"🗓 시작: {self.US_START_DATE} | 💵 시작금액: `{self.format_currency(self.US_START_AMOUNT, 'USD')}`\n"
 
             if us_account_summary:
                 us_total_eval = us_account_summary.get('total_eval_amount', 0)
@@ -222,6 +229,23 @@ class PortfolioTelegramReporter:
                 us_total_profit_rate = us_account_summary.get('total_profit_rate', 0)
                 us_cash = us_account_summary.get('usd_cash', 0)
                 exchange_rate = us_account_summary.get('exchange_rate', 0)
+                us_net_unsettled = us_account_summary.get('net_unsettled_usd', 0)
+
+                # USD-denominated total assets = stock eval + USD cash + net unsettled trades
+                # (excludes KRW cash). The net-unsettled term keeps cash on the same
+                # trade-date basis as the eval so the season return does not see-saw with
+                # D+2 settlement; falls back to eval+cash if the field is unavailable.
+                us_total_asset_usd = us_account_summary.get('total_asset_usd', 0) or 0
+                us_total_assets = us_total_asset_usd if us_total_asset_usd > 0 else (us_total_eval + us_cash)
+
+                # Season profit measured from the US start amount
+                us_season_profit = us_total_assets - self.US_START_AMOUNT
+                us_season_rate = (us_season_profit / self.US_START_AMOUNT) * 100 if self.US_START_AMOUNT > 0 else 0
+                season_emoji = "📈" if us_season_profit >= 0 else "📉"
+
+                message += f"💰 총 자산: `{self.format_currency(us_total_assets, 'USD')}`\n"
+                message += f"{season_emoji} 시즌 수익: `{self.format_currency_with_sign(us_season_profit, 'USD')}` "
+                message += f"({self.format_percentage(us_season_rate)})\n"
 
                 # Show stock evaluation if any holdings
                 if us_total_eval > 0:
@@ -238,6 +262,10 @@ class PortfolioTelegramReporter:
                     message += f"📈 환율: `{exchange_rate:,.2f}원/USD`\n"
                 else:
                     message += "\n"
+
+                # In-transit settlement so 총자산 reconciles with 보유주식 + USD현금
+                if abs(us_net_unsettled) >= 0.01:
+                    message += f"🔄 정산중(미결제): `{self.format_currency_with_sign(us_net_unsettled, 'USD')}`\n"
             else:
                 message += "❌ 계좌 정보를 가져올 수 없습니다\n"
 
@@ -439,7 +467,7 @@ class PortfolioTelegramReporter:
                     # Translate message
                     translated_message = await translate_telegram_message(
                         original_message,
-                        model="gpt-5-nano",
+                        model="gpt-5.4-nano",
                         from_lang="ko",
                         to_lang=lang
                     )
@@ -496,7 +524,7 @@ class PortfolioTelegramReporter:
 
                 profit_emoji = "📈" if total_profit >= 0 else "📉"
 
-                message += f"🇰🇷 *Korea*\n"
+                message += "🇰🇷 *Korea*\n"
                 message += f"💼 Total Value: {self.format_currency(total_eval)}\n"
                 message += f"{profit_emoji} P/L: {self.format_currency_with_sign(total_profit)} ({self.format_percentage(total_profit_rate)})\n"
             else:
@@ -509,7 +537,7 @@ class PortfolioTelegramReporter:
                 us_total_profit_rate = us_account_summary.get('total_profit_rate', 0)
                 us_cash = us_account_summary.get('usd_cash', 0)
 
-                message += f"\n🇺🇸 *USA*\n"
+                message += "\n🇺🇸 *USA*\n"
                 if us_total_eval > 0:
                     us_profit_emoji = "📈" if us_total_profit >= 0 else "📉"
                     message += f"📊 Holdings: {self.format_currency(us_total_eval, 'USD')}\n"

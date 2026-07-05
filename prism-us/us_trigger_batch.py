@@ -39,7 +39,6 @@ from cores.us_surge_detector import (
     get_previous_snapshot,
     get_multi_day_ohlcv,
     get_major_tickers,
-    get_ticker_name,
     get_nearest_business_day,
     apply_absolute_filters,
     normalize_and_score,
@@ -74,6 +73,20 @@ TRIGGER_CRITERIA = {
 
 # Trading value filter: $100M USD
 MIN_TRADING_VALUE = 100_000_000
+
+# Fail-closed: downstream report/trading expects three fresh candidates. If the
+# trigger stage cannot produce three candidates from current OHLCV data, stop
+# before report generation, Telegram, or orders.
+MIN_FINAL_SELECTIONS = int(os.getenv("PRISM_US_MIN_FINAL_SELECTIONS", "3"))
+
+
+def _count_final_results(final_results: dict) -> int:
+    """Count unique tickers in final trigger results."""
+    selected = set()
+    for stocks_df in final_results.values():
+        if stocks_df is not None and not stocks_df.empty:
+            selected.update(stocks_df.index.tolist())
+    return len(selected)
 
 
 def calculate_agent_fit_metrics(ticker: str, current_price: float, trade_date: str,
@@ -285,7 +298,7 @@ def trigger_morning_volume_surge(trade_date: str, snapshot: pd.DataFrame,
     candidates = scored.head(top_n)
 
     # Secondary filter: Only rising stocks
-    result = candidates[candidates["IsRising"] == True].copy()
+    result = candidates[candidates["IsRising"]].copy()
 
     if result.empty:
         logger.debug("trigger_morning_volume_surge: No qualifying stocks")
@@ -348,7 +361,7 @@ def trigger_morning_gap_up_momentum(trade_date: str, snapshot: pd.DataFrame,
     candidates = snap.sort_values("CompositeScore", ascending=False).head(top_n)
 
     # Secondary filter: Momentum continuing stocks only
-    result = candidates[candidates["MomentumContinuing"] == True].copy()
+    result = candidates[candidates["MomentumContinuing"]].copy()
 
     if result.empty:
         logger.debug("trigger_morning_gap_up_momentum: No qualifying stocks")
@@ -430,7 +443,7 @@ def trigger_morning_value_to_cap_ratio(trade_date: str, snapshot: pd.DataFrame,
         candidates = merged.sort_values("CompositeScore", ascending=False).head(top_n)
 
         # Secondary filter: Rising stocks only
-        result = candidates[candidates["IsRising"] == True].copy()
+        result = candidates[candidates["IsRising"]].copy()
 
         if result.empty:
             return pd.DataFrame()
@@ -531,7 +544,7 @@ def trigger_afternoon_closing_strength(trade_date: str, snapshot: pd.DataFrame,
     snap["IsRising"] = snap["Close"] > snap["Open"]
 
     # Primary filter: Volume increase stocks
-    candidates = snap[snap["VolumeIncreased"] == True].copy()
+    candidates = snap[snap["VolumeIncreased"]].copy()
 
     if candidates.empty:
         logger.debug("trigger_afternoon_closing_strength: No volume increase stocks")
@@ -553,7 +566,7 @@ def trigger_afternoon_closing_strength(trade_date: str, snapshot: pd.DataFrame,
     candidates = candidates.sort_values("CompositeScore", ascending=False).head(top_n)
 
     # Secondary filter: Rising stocks only
-    result = candidates[candidates["IsRising"] == True].copy()
+    result = candidates[candidates["IsRising"]].copy()
 
     if result.empty:
         logger.debug("trigger_afternoon_closing_strength: No qualifying stocks")
@@ -561,6 +574,25 @@ def trigger_afternoon_closing_strength(trade_date: str, snapshot: pd.DataFrame,
 
     logger.debug(f"Closing strength top detected: {len(result)} stocks")
     return enhance_dataframe(result.sort_values("CompositeScore", ascending=False).head(10))
+
+
+# Sideways trigger downtrend gate (#289 follow-up, mirrors KR trigger_batch.py):
+# a genuine consolidation base forms at/above the 20-day mean; a stock below MA20
+# on a quiet day is a downtrend, not a base. Allow a support test within -3% of MA20.
+SIDEWAYS_MA20_SUPPORT_TOLERANCE = 0.97
+
+
+def _compute_ma20(ticker: str, trade_date: str, lookback_days: int = 20) -> float:
+    """20-day moving average of close for the sideways downtrend gate.
+    Returns 0.0 when data is unavailable (gate treats 0 as 'unknown → pass')."""
+    df = get_multi_day_ohlcv(ticker, trade_date, lookback_days)
+    if df.empty:
+        return 0.0
+    close_col = "Close" if "Close" in df.columns else "종가"
+    if close_col not in df.columns:
+        return 0.0
+    closes = df[close_col][df[close_col] > 0].tail(20)
+    return float(closes.mean()) if len(closes) > 0 else 0.0
 
 
 def trigger_afternoon_volume_surge_flat(trade_date: str, snapshot: pd.DataFrame,
@@ -610,10 +642,28 @@ def trigger_afternoon_volume_surge_flat(trade_date: str, snapshot: pd.DataFrame,
     candidates = scored.head(top_n)
 
     # Secondary filter: Sideways stocks only
-    result = candidates[candidates["IsSideways"] == True].copy()
+    result = candidates[candidates["IsSideways"]].copy()
 
     if result.empty:
         logger.debug("trigger_afternoon_volume_surge_flat: No sideways stocks")
+        return pd.DataFrame()
+
+    # #289 follow-up: downtrend gate. IsSideways only checks |today's move| <= 5%,
+    # mislabeling a downtrending stock (below MA20) as "sideways". A real base sits
+    # at/above the 20-day mean — exclude names clearly below MA20.
+    kept_mask = []
+    for ticker in result.index:
+        ma20 = _compute_ma20(ticker, trade_date)
+        close_price = float(result.loc[ticker, "Close"])
+        kept_mask.append(ma20 <= 0 or close_price >= ma20 * SIDEWAYS_MA20_SUPPORT_TOLERANCE)
+    excluded = len(result) - sum(kept_mask)
+    result = result[pd.Series(kept_mask, index=result.index)].copy()
+    if excluded:
+        logger.debug(f"trigger_afternoon_volume_surge_flat: downtrend gate excluded "
+                     f"{excluded} stock(s) below MA20")
+
+    if result.empty:
+        logger.debug("trigger_afternoon_volume_surge_flat: No stocks after downtrend gate")
         return pd.DataFrame()
 
     logger.debug(f"Volume surge sideways detected: {len(result)} stocks")
@@ -677,9 +727,9 @@ def trigger_macro_sector_leader(trade_date: str, snapshot: pd.DataFrame,
         if stock_sector in leading_names:
             matched_sector = stock_sector
         else:
-            for l in leading_names:
-                if stock_sector in l or l in stock_sector:
-                    matched_sector = l
+            for lead_name in leading_names:
+                if stock_sector in lead_name or lead_name in stock_sector:
+                    matched_sector = lead_name
                     break
         if matched_sector:
             matched_rows.append(ticker)
@@ -899,9 +949,9 @@ def _build_topdown_pool(trigger_candidates: dict, macro_context: dict, score_col
             if stock_sector in leading_names:
                 matched_sector = stock_sector
             else:
-                for l in leading_names:
-                    if stock_sector in l or l in stock_sector:
-                        matched_sector = l
+                for lead_name in leading_names:
+                    if stock_sector in lead_name or lead_name in stock_sector:
+                        matched_sector = lead_name
                         break
             if matched_sector:
                 base_score = df.loc[ticker, score_column]
@@ -1231,6 +1281,12 @@ def run_batch(trigger_time: str, log_level: str = "INFO", output_file: str = Non
 
     # Final selection
     final_results = select_final_tickers(triggers, trade_date=trade_date, macro_context=macro_context)
+    final_count = _count_final_results(final_results)
+    if final_count < MIN_FINAL_SELECTIONS:
+        raise RuntimeError(
+            f"Fail-closed: only {final_count}/{MIN_FINAL_SELECTIONS} US candidates selected "
+            f"from fresh yfinance data; stop before report/trading stages"
+        )
 
     # Save to JSON if requested
     if output_file:
