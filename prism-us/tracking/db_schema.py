@@ -210,6 +210,31 @@ CREATE TABLE IF NOT EXISTS us_pending_orders (
 )
 """
 
+# Table: us_order_ledger - Active/past KIS order ledger for duplicate-order guard
+TABLE_US_ORDER_LEDGER = """
+CREATE TABLE IF NOT EXISTS us_order_ledger (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_key TEXT NOT NULL,
+    account_name TEXT,
+    product_code TEXT,
+    mode TEXT,
+    ticker TEXT NOT NULL,
+    side TEXT NOT NULL,                -- buy or sell
+    status TEXT NOT NULL,              -- queued, submitted, open, filled, cancelled, failed, expired, quarantined
+    source TEXT NOT NULL,              -- pending_queue, kis_open_orders, kis_submit, bootstrap, quarantine
+    order_no TEXT,
+    pending_order_id INTEGER,
+    order_type TEXT,
+    limit_price REAL,
+    quantity INTEGER,
+    exchange TEXT,
+    raw_order_json TEXT,
+    quarantine_reason TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+)
+"""
+
 # Table: us_portfolio_adjustment_log (target/stop_loss change history)
 TABLE_US_PORTFOLIO_ADJUSTMENT_LOG = """
 CREATE TABLE IF NOT EXISTS us_portfolio_adjustment_log (
@@ -263,6 +288,18 @@ US_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_us_pending_account_key ON us_pending_orders(account_key)",
     "CREATE INDEX IF NOT EXISTS idx_us_pending_status ON us_pending_orders(status)",
     "CREATE INDEX IF NOT EXISTS idx_us_pending_created ON us_pending_orders(created_at)",
+
+    # us_order_ledger indexes
+    "CREATE INDEX IF NOT EXISTS idx_us_order_ledger_account_ticker ON us_order_ledger(account_key, ticker)",
+    "CREATE INDEX IF NOT EXISTS idx_us_order_ledger_order_no ON us_order_ledger(order_no)",
+    "CREATE INDEX IF NOT EXISTS idx_us_order_ledger_pending_id ON us_order_ledger(pending_order_id)",
+    "CREATE INDEX IF NOT EXISTS idx_us_order_ledger_status ON us_order_ledger(status)",
+    # Only one active BUY per account/ticker can exist across queued/submitted/open/quarantined states.
+    "CREATE UNIQUE INDEX IF NOT EXISTS ux_us_order_ledger_active_buy_v2 ON us_order_ledger(account_key, ticker) "
+    "WHERE lower(side) = 'buy' AND lower(status) IN "
+    "('submitting', 'submission_uncertain', 'queued', 'submitted', 'open', "
+    "'closed_unverified', 'quarantined')",
+
     # us_portfolio_adjustment_log indexes
     "CREATE INDEX IF NOT EXISTS idx_us_adj_log_ticker ON us_portfolio_adjustment_log(account_key, ticker)",
     "CREATE INDEX IF NOT EXISTS idx_us_adj_log_date ON us_portfolio_adjustment_log(adjusted_at DESC)",
@@ -668,6 +705,7 @@ def create_us_tables(cursor, conn):
         ("us_analysis_performance_tracker", TABLE_US_PERFORMANCE_TRACKER),
         ("us_holding_decisions", TABLE_US_HOLDING_DECISIONS),
         ("us_pending_orders", TABLE_US_PENDING_ORDERS),
+        ("us_order_ledger", TABLE_US_ORDER_LEDGER),
         ("us_portfolio_adjustment_log", TABLE_US_PORTFOLIO_ADJUSTMENT_LOG),
     ]
 
@@ -677,6 +715,9 @@ def create_us_tables(cursor, conn):
             logger.info(f"Created/verified table: {table_name}")
         except Exception as e:
             logger.error(f"Error creating table {table_name}: {e}")
+            if table_name == "us_order_ledger":
+                conn.rollback()
+                raise
 
     migrate_multi_account_schema(cursor, conn)
     migrate_drop_us_holdings_unique_constraint(cursor, conn)
@@ -719,6 +760,10 @@ def create_us_indexes(cursor, conn):
         try:
             cursor.execute(index_sql)
         except Exception as e:
+            if "ux_us_order_ledger_active_buy" in index_sql:
+                conn.rollback()
+                logger.error(f"Critical active-BUY index creation failed: {e}")
+                raise
             logger.warning(f"Index creation warning: {e}")
 
     conn.commit()

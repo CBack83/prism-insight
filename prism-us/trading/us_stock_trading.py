@@ -37,6 +37,7 @@ PROJECT_ROOT = TRADING_DIR.parent.parent
 import sys
 sys.path.insert(0, str(PROJECT_ROOT / "trading"))
 import kis_auth as ka
+from order_ledger_safety import sanitize_order_payload, sanitize_reason
 
 # Logging setup
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -50,6 +51,215 @@ with open(CONFIG_FILE, encoding="UTF-8") as f:
 # Timezones
 US_EASTERN = pytz.timezone('US/Eastern')
 KST = pytz.timezone('Asia/Seoul')
+
+ACTIVE_BUY_LEDGER_STATUSES = (
+    "submitting",
+    "submission_uncertain",
+    "queued",
+    "submitted",
+    "open",
+    "closed_unverified",
+    "quarantined",
+)
+
+
+def _order_ledger_now() -> str:
+    return datetime.datetime.now(KST).strftime('%Y-%m-%d %H:%M:%S')
+
+
+def _order_ledger_db_path() -> Path:
+    return PROJECT_ROOT / "stock_tracking_db.sqlite"
+
+
+def _ensure_us_order_ledger(conn, *, commit: bool = True) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS us_order_ledger (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_key TEXT NOT NULL,
+            account_name TEXT,
+            product_code TEXT,
+            mode TEXT,
+            ticker TEXT NOT NULL,
+            side TEXT NOT NULL,
+            status TEXT NOT NULL,
+            source TEXT NOT NULL,
+            order_no TEXT,
+            pending_order_id INTEGER,
+            order_type TEXT,
+            limit_price REAL,
+            quantity INTEGER,
+            exchange TEXT,
+            raw_order_json TEXT,
+            quarantine_reason TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_us_order_ledger_account_ticker "
+        "ON us_order_ledger(account_key, ticker)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_us_order_ledger_order_no "
+        "ON us_order_ledger(order_no)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_us_order_ledger_pending_id "
+        "ON us_order_ledger(pending_order_id)"
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_us_order_ledger_active_buy_v2 "
+        "ON us_order_ledger(account_key, ticker) "
+        "WHERE lower(side) = 'buy' AND lower(status) IN "
+        "('submitting', 'submission_uncertain', 'queued', 'submitted', 'open', 'closed_unverified', 'quarantined')"
+    )
+    if commit:
+        conn.commit()
+
+
+def _bootstrap_pending_orders_to_ledger(conn, *, commit: bool = True) -> int:
+    """Adopt legacy pending BUY queue rows into the order ledger.
+
+    These rows are not visible to KIS until the 10:05 batch submits them, so they
+    must still block same-account/same-ticker buys.
+    """
+    _ensure_us_order_ledger(conn, commit=commit)
+    pending_table = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='us_pending_orders'"
+    ).fetchone()
+    if not pending_table:
+        return 0
+    now = _order_ledger_now()
+    rows = conn.execute(
+        """
+        SELECT id, account_key, account_name, product_code, mode, ticker, order_type,
+               limit_price, buy_amount, exchange, created_at
+        FROM us_pending_orders
+        WHERE lower(status) = 'pending' AND lower(order_type) = 'buy'
+        """
+    ).fetchall()
+    inserted = 0
+    for row in rows:
+        (
+            pending_id,
+            account_key,
+            account_name,
+            product_code,
+            mode,
+            ticker,
+            order_type,
+            limit_price,
+            buy_amount,
+            exchange,
+            created_at,
+        ) = row
+        try:
+            conn.execute(
+                """
+                INSERT INTO us_order_ledger
+                (account_key, account_name, product_code, mode, ticker, side, status,
+                 source, pending_order_id, order_type, limit_price, quantity, exchange,
+                 raw_order_json, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, 'buy', 'queued', 'pending_queue', ?, ?, ?, NULL, ?, ?, ?, ?)
+                """,
+                (
+                    account_key,
+                    account_name,
+                    product_code,
+                    mode,
+                    str(ticker).upper(),
+                    pending_id,
+                    order_type,
+                    limit_price,
+                    exchange,
+                    json.dumps({"pending_order_id": pending_id, "buy_amount": buy_amount}),
+                    created_at or now,
+                    now,
+                ),
+            )
+            inserted += 1
+        except Exception as exc:
+            if "UNIQUE constraint failed" in str(exc):
+                conn.execute(
+                    """
+                    UPDATE us_order_ledger
+                    SET status = 'quarantined',
+                        quarantine_reason = ?,
+                        updated_at = ?
+                    WHERE account_key = ? AND ticker = ? AND lower(side) = 'buy'
+                      AND lower(status) IN ('submitting', 'submission_uncertain', 'queued', 'submitted', 'open', 'closed_unverified', 'quarantined')
+                    """,
+                    (
+                        "duplicate active buy while bootstrapping legacy us_pending_orders",
+                        now,
+                        account_key,
+                        str(ticker).upper(),
+                    ),
+                )
+            else:
+                raise
+    if commit:
+        conn.commit()
+    return inserted
+
+
+def _record_us_order_ledger(
+    conn,
+    *,
+    account_key: str,
+    account_name: str = None,
+    product_code: str = None,
+    mode: str = None,
+    ticker: str,
+    side: str,
+    status: str,
+    source: str,
+    order_no: str = None,
+    pending_order_id: int = None,
+    order_type: str = None,
+    limit_price: float = None,
+    quantity: int = None,
+    exchange: str = None,
+    raw_order: Dict[str, Any] = None,
+    quarantine_reason: str = None,
+    commit: bool = True,
+) -> int:
+    _ensure_us_order_ledger(conn, commit=commit)
+    now = _order_ledger_now()
+    cursor = conn.execute(
+        """
+        INSERT INTO us_order_ledger
+        (account_key, account_name, product_code, mode, ticker, side, status, source,
+         order_no, pending_order_id, order_type, limit_price, quantity, exchange,
+         raw_order_json, quarantine_reason, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            account_key,
+            account_name,
+            product_code,
+            mode,
+            ticker.upper(),
+            side.lower(),
+            status.lower(),
+            source,
+            order_no,
+            pending_order_id,
+            order_type,
+            limit_price,
+            quantity,
+            exchange,
+            json.dumps(sanitize_order_payload(raw_order)) if raw_order is not None else None,
+            sanitize_reason(quarantine_reason),
+            now,
+            now,
+        ),
+    )
+    if commit:
+        conn.commit()
+    return int(cursor.lastrowid)
 
 
 # =============================================================================
@@ -167,7 +377,8 @@ def _load_exchange_cache() -> Dict[str, str]:
                     return {k.upper(): v for k, v in data.items() if isinstance(v, str)}
                 logger.warning(f"[exchange] Cache file is not a dict: {_EXCHANGE_CACHE_FILE}")
     except (json.JSONDecodeError, OSError) as e:
-        logger.warning(f"[exchange] Failed to load cache file ({_EXCHANGE_CACHE_FILE}): {e} — starting empty")
+        safe_error = sanitize_reason(str(e)) or "Unknown exchange-cache read error"
+        logger.warning(f"[exchange] Failed to load cache file ({_EXCHANGE_CACHE_FILE}): {safe_error} — starting empty")
     return {}
 
 
@@ -181,7 +392,8 @@ def _save_exchange_cache(cache: Dict[str, str]) -> None:
             f.write("\n")
         os.replace(tmp_path, _EXCHANGE_CACHE_FILE)
     except OSError as e:
-        logger.warning(f"[exchange] Failed to save cache file ({_EXCHANGE_CACHE_FILE}): {e}")
+        safe_error = sanitize_reason(str(e)) or "Unknown exchange-cache write error"
+        logger.warning(f"[exchange] Failed to save cache file ({_EXCHANGE_CACHE_FILE}): {safe_error}")
 
 
 _EXCHANGE_CACHE: Dict[str, str] = _load_exchange_cache()
@@ -218,7 +430,8 @@ def get_exchange_code(ticker: str) -> str:
             logger.info(f"[exchange] {ticker_upper}: yfinance={exch} → KIS={kis_code} (cached)")
             return kis_code
     except Exception as e:
-        logger.warning(f"[exchange] yfinance lookup failed for {ticker_upper}: {e} — defaulting to NYSE")
+        safe_error = sanitize_reason(str(e)) or "Unknown exchange lookup error"
+        logger.warning(f"[exchange] yfinance lookup failed for {ticker_upper}: {safe_error} — defaulting to NYSE")
         return "NYSE"
 
     # yfinance returned an exchange we don't know how to map.
@@ -286,8 +499,9 @@ class USStockTrading:
         try:
             self.trenv = ka.getTREnv()
         except RuntimeError as e:
+            safe_error = sanitize_reason(str(e)) or "Unknown KIS authentication error"
             print("❌ KIS API authentication failed!")
-            print(f"Mode: {self.mode}, Error: {e}")
+            print(f"Mode: {self.mode}, Error: {safe_error}")
             print("📋 Please check kis_devlp.yaml settings.")
             raise RuntimeError(f"{self.mode} mode authentication failed") from e
 
@@ -313,6 +527,291 @@ class USStockTrading:
         with ka.get_trading_env_lock():
             self._activate_account()
             return ka._url_fetch(api_url, tr_id, "", params, **kwargs)
+
+    def _with_order_ledger(self, callback):
+        import sqlite3
+
+        db_path = _order_ledger_db_path()
+        conn = sqlite3.connect(str(db_path))
+        try:
+            _ensure_us_order_ledger(conn)
+            return callback(conn)
+        finally:
+            conn.close()
+
+    def _claim_buy_submission(self, ticker: str, quantity: int,
+                              limit_price: float, exchange: str = None) -> Optional[int]:
+        """Atomically claim the right to submit one BUY across processes."""
+        import sqlite3
+
+        def _claim(conn):
+            try:
+                return _record_us_order_ledger(
+                    conn,
+                    account_key=self.account_key,
+                    account_name=self.account_name,
+                    product_code=self.product_code,
+                    mode=self.mode,
+                    ticker=ticker,
+                    side="buy",
+                    status="submitting",
+                    source="kis_submit_claim",
+                    order_type="limit",
+                    limit_price=limit_price,
+                    quantity=quantity,
+                    exchange=exchange,
+                )
+            except sqlite3.IntegrityError:
+                conn.rollback()
+                return None
+
+        return self._with_order_ledger(_claim)
+
+    def _validate_buy_submission_claim(self, ticker: str,
+                                       submission_ledger_id: Optional[int] = None) -> bool:
+        """Verify that the caller owns an active pre-submit ledger claim."""
+        if submission_ledger_id is None:
+            return False
+
+        def _validate(conn):
+            row = conn.execute(
+                """
+                SELECT id
+                FROM us_order_ledger
+                WHERE id = ?
+                  AND account_key = ?
+                  AND upper(ticker) = ?
+                  AND lower(side) = 'buy'
+                  AND lower(status) = 'submitting'
+                """,
+                (
+                    submission_ledger_id,
+                    self.account_key,
+                    str(ticker).strip().upper(),
+                ),
+            ).fetchone()
+            return row is not None
+
+        return self._with_order_ledger(_validate)
+
+    @staticmethod
+    def _missing_buy_claim_result(ticker: str, *, limit_price: Optional[float] = None) -> Dict[str, Any]:
+        result = {
+            'success': False,
+            'order_no': None,
+            'ticker': ticker,
+            'quantity': 0,
+            'message': 'Direct KIS BUY blocked: valid submission claim is required',
+        }
+        if limit_price is not None:
+            result['limit_price'] = limit_price
+        return result
+
+    def _update_buy_submission_claim(self, ledger_id: int, status: str,
+                                     order_result: Dict[str, Any] = None,
+                                     reason: str = None) -> None:
+        """Persist a claimed submission outcome without creating a second row."""
+        sanitized = sanitize_order_payload(order_result)
+        order_no = (order_result or {}).get("order_no")
+        now = _order_ledger_now()
+
+        def _update(conn):
+            conn.execute(
+                """
+                UPDATE us_order_ledger
+                SET status = ?, order_no = COALESCE(?, order_no),
+                    raw_order_json = ?, quarantine_reason = ?, updated_at = ?
+                WHERE id = ? AND account_key = ?
+                """,
+                (
+                    status,
+                    order_no,
+                    json.dumps(sanitized) if sanitized else None,
+                    sanitize_reason(reason),
+                    now,
+                    ledger_id,
+                    self.account_key,
+                ),
+            )
+            conn.commit()
+
+        self._with_order_ledger(_update)
+
+    def _get_active_buy_ledger_row(self, conn, ticker: str) -> Optional[Dict[str, Any]]:
+        cursor = conn.execute(
+            """
+            SELECT id, account_key, ticker, status, source, order_no, pending_order_id, quarantine_reason
+            FROM us_order_ledger
+            WHERE account_key = ? AND ticker = ? AND lower(side) = 'buy'
+              AND lower(status) IN ('submitting', 'submission_uncertain', 'queued', 'submitted', 'open', 'closed_unverified', 'quarantined')
+            ORDER BY id ASC
+            LIMIT 1
+            """,
+            (self.account_key, ticker.upper()),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return None
+        columns = [desc[0] for desc in cursor.description]
+        return dict(zip(columns, row))
+
+    def _reconcile_active_buy_ledger(self, conn, ticker: str, live_buy_order_nos: set[str]) -> None:
+        """Keep missing open orders blocked until execution history verifies closure.
+
+        An order disappearing from the KIS unfilled-order response does not prove
+        fill, cancellation, rejection, or expiry. Mark it closed-unverified and
+        keep the duplicate-buy guard active.
+        """
+        now = _order_ledger_now()
+        rows = conn.execute(
+            """
+            SELECT id, order_no, source, status
+            FROM us_order_ledger
+            WHERE account_key = ? AND ticker = ? AND lower(side) = 'buy'
+              AND lower(status) IN ('submitted', 'open')
+            """,
+            (self.account_key, ticker.upper()),
+        ).fetchall()
+        for row_id, order_no, _source, _status in rows:
+            if order_no and order_no in live_buy_order_nos:
+                continue
+            conn.execute(
+                """
+                UPDATE us_order_ledger
+                SET status = 'closed_unverified', updated_at = ?
+                WHERE id = ?
+                """,
+                (now, row_id),
+            )
+        conn.commit()
+
+    def _bootstrap_kis_open_buys_to_ledger(self, conn, ticker: str, open_orders: List[Dict[str, Any]]) -> set[str]:
+        live_buy_order_nos: set[str] = set()
+        for order in open_orders:
+            side_code = str(order.get("sll_buy_dvsn_cd", "") or "")
+            if side_code != "02":
+                continue
+            order_no = str(order.get("order_no", "") or "")
+            if order_no:
+                live_buy_order_nos.add(order_no)
+            try:
+                _record_us_order_ledger(
+                    conn,
+                    account_key=self.account_key,
+                    account_name=self.account_name,
+                    product_code=self.product_code,
+                    mode=self.mode,
+                    ticker=ticker,
+                    side="buy",
+                    status="open",
+                    source="kis_open_orders",
+                    order_no=order_no or None,
+                    order_type="limit",
+                    limit_price=order.get("ord_unpr"),
+                    quantity=order.get("nccs_qty"),
+                    exchange=order.get("exchange"),
+                    raw_order=order,
+                )
+            except Exception as exc:
+                if "UNIQUE constraint failed" not in str(exc):
+                    raise
+        return live_buy_order_nos
+
+    def _preflight_buy_order_guard(self, ticker: str, exchange: str = None) -> Optional[Dict[str, Any]]:
+        """Fail-closed duplicate-buy guard for US orders."""
+        ticker_upper = ticker.upper()
+
+        def _guard(conn):
+            _bootstrap_pending_orders_to_ledger(conn)
+
+            exchanges = [exchange] if exchange else ["NASD", "NYSE", "AMEX"]
+            open_orders = []
+            for exchange_code in exchanges:
+                open_orders.extend(self.get_unfilled_orders(ticker=ticker_upper, exchange=exchange_code))
+                if not getattr(self, "_last_unfilled_order_inquiry_ok", False):
+                    return {
+                        "success": False,
+                        "order_no": None,
+                        "ticker": ticker_upper,
+                        "quantity": 0,
+                        "message": (
+                            f"Buy blocked for {ticker_upper}: could not verify KIS open orders "
+                            f"for {exchange_code} (fail-closed duplicate-order guard)"
+                        ),
+                    }
+
+            live_buy_order_nos = self._bootstrap_kis_open_buys_to_ledger(conn, ticker_upper, open_orders)
+            self._reconcile_active_buy_ledger(conn, ticker_upper, live_buy_order_nos)
+
+            active = self._get_active_buy_ledger_row(conn, ticker_upper)
+            if active:
+                return {
+                    "success": False,
+                    "order_no": active.get("order_no"),
+                    "ticker": ticker_upper,
+                    "quantity": 0,
+                    "message": (
+                        f"Buy blocked for {ticker_upper}: active buy order exists "
+                        f"(status={active.get('status')}, source={active.get('source')}, "
+                        f"ledger_id={active.get('id')})"
+                    ),
+                }
+            return None
+
+        return self._with_order_ledger(_guard)
+
+    def _record_successful_buy_order(self, ticker: str, order_result: Dict[str, Any], *,
+                                     limit_price: float = None, quantity: int = None,
+                                     exchange: str = None, ledger_id: int = None) -> None:
+        order_type = str(order_result.get("order_type") or "")
+        order_no = order_result.get("order_no")
+        status = "queued" if order_type.startswith("queued_") else "submitted"
+        if ledger_id is not None:
+            self._update_buy_submission_claim(
+                ledger_id,
+                status,
+                order_result=order_result,
+            )
+            return
+        pending_order_id = None
+        if isinstance(order_no, str) and order_no.startswith("PENDING-"):
+            try:
+                pending_order_id = int(order_no.split("-", 1)[1])
+            except ValueError:
+                pending_order_id = None
+
+        def _record(conn):
+            if pending_order_id is not None:
+                existing = conn.execute(
+                    "SELECT id FROM us_order_ledger WHERE pending_order_id = ?",
+                    (pending_order_id,),
+                ).fetchone()
+                if existing:
+                    return
+            _record_us_order_ledger(
+                conn,
+                account_key=self.account_key,
+                account_name=self.account_name,
+                product_code=self.product_code,
+                mode=self.mode,
+                ticker=ticker,
+                side="buy",
+                status=status,
+                source="kis_submit" if status == "submitted" else "pending_queue",
+                order_no=order_no,
+                pending_order_id=pending_order_id,
+                order_type=order_type,
+                limit_price=limit_price,
+                quantity=quantity,
+                exchange=exchange,
+                raw_order=order_result,
+            )
+
+        try:
+            self._with_order_ledger(_record)
+        except Exception as exc:
+            safe_error = sanitize_reason(str(exc)) or "Unknown ledger persistence error"
+            logger.error(f"[{ticker}] Failed to record buy order ledger entry: {safe_error}")
 
     def _probe_exchange(self, ticker: str) -> Optional[str]:
         """
@@ -342,7 +841,8 @@ class USStockTrading:
                     if last > 0 or base > 0:
                         return kis_code
             except Exception as e:
-                logger.warning(f"[exchange] KIS probe error {ticker_upper}/{price_excd}: {e}")
+                safe_error = sanitize_reason(str(e)) or "Unknown KIS probe error"
+                logger.warning(f"[exchange] KIS probe error {ticker_upper}/{price_excd}: {safe_error}")
 
         return None
 
@@ -441,11 +941,15 @@ class USStockTrading:
                 logger.info(f"[{ticker}] Current price: ${result['current_price']:.2f} ({result['change_rate']:+.2f}%)")
                 return result
             else:
-                logger.error(f"Price query failed: {res.getErrorCode()} - {res.getErrorMessage()}")
+                safe_error = sanitize_reason(
+                    f"{res.getErrorCode()} - {res.getErrorMessage()}"
+                ) or "Broker rejected price inquiry"
+                logger.error(f"Price query failed: {safe_error}")
                 return None
 
         except Exception as e:
-            logger.error(f"Error getting price: {str(e)}")
+            safe_error = sanitize_reason(str(e)) or "Unknown price inquiry error"
+            logger.error(f"Error getting price: {safe_error}")
             return None
 
     def calculate_buy_quantity(self, ticker: str, buy_amount: float = None,
@@ -487,7 +991,8 @@ class USStockTrading:
         return quantity
 
     def buy_market_price(self, ticker: str, buy_amount: float = None,
-                         exchange: str = None) -> Dict[str, Any]:
+                         exchange: str = None,
+                         submission_ledger_id: Optional[int] = None) -> Dict[str, Any]:
         """
         Market price buy for US stock
 
@@ -513,6 +1018,9 @@ class USStockTrading:
                 'quantity': 0,
                 'message': 'Auto trading is disabled (AUTO_TRADING=False)'
             }
+
+        if not self._validate_buy_submission_claim(ticker, submission_ledger_id):
+            return self._missing_buy_claim_result(ticker)
 
         if exchange is None:
             exchange = self._resolve_exchange(ticker)
@@ -568,7 +1076,9 @@ class USStockTrading:
                     'message': f'Market buy order completed ({buy_quantity} shares)'
                 }
             else:
-                error_msg = f"{res.getErrorCode()} - {res.getErrorMessage()}"
+                error_msg = sanitize_reason(
+                    f"{res.getErrorCode()} - {res.getErrorMessage()}"
+                ) or "Broker rejected BUY order"
                 logger.error(f"Buy order failed: {error_msg}")
 
                 return {
@@ -580,17 +1090,19 @@ class USStockTrading:
                 }
 
         except Exception as e:
-            logger.error(f"Error during buy order: {str(e)}")
+            safe_error = sanitize_reason(str(e)) or "Unknown BUY transport error"
+            logger.error(f"Error during buy order: {safe_error}")
             return {
                 'success': False,
                 'order_no': None,
                 'ticker': ticker,
                 'quantity': buy_quantity,
-                'message': f'Buy order error: {str(e)}'
+                'message': f'Buy order error: {safe_error}'
             }
 
     def buy_limit_price(self, ticker: str, limit_price: float, buy_amount: float = None,
-                        exchange: str = None) -> Dict[str, Any]:
+                        exchange: str = None,
+                        submission_ledger_id: Optional[int] = None) -> Dict[str, Any]:
         """
         Limit price buy for US stock
 
@@ -612,6 +1124,9 @@ class USStockTrading:
                 'limit_price': limit_price,
                 'message': 'Auto trading is disabled (AUTO_TRADING=False)'
             }
+
+        if not self._validate_buy_submission_claim(ticker, submission_ledger_id):
+            return self._missing_buy_claim_result(ticker, limit_price=limit_price)
 
         if exchange is None:
             exchange = self._resolve_exchange(ticker)
@@ -671,7 +1186,9 @@ class USStockTrading:
                 }
             else:
                 error_code = res.getErrorCode()
-                error_msg = f"{error_code} - {res.getErrorMessage()}"
+                error_msg = sanitize_reason(
+                    f"{error_code} - {res.getErrorMessage()}"
+                ) or "Broker rejected limit BUY order"
                 if error_code == "APBK0656":
                     logger.error(f"Limit buy order failed: {error_msg} (exchange={exchange}, ticker={ticker.upper()}) — stock may not be in KIS universe for this exchange")
                 else:
@@ -687,14 +1204,15 @@ class USStockTrading:
                 }
 
         except Exception as e:
-            logger.error(f"Error during limit buy: {str(e)}")
+            safe_error = sanitize_reason(str(e)) or "Unknown limit BUY transport error"
+            logger.error(f"Error during limit buy: {safe_error}")
             return {
                 'success': False,
                 'order_no': None,
                 'ticker': ticker,
                 'quantity': buy_quantity,
                 'limit_price': limit_price,
-                'message': f'Buy order error: {str(e)}'
+                'message': f'Buy order error: {safe_error}'
             }
 
     def get_holding_quantity(self, ticker: str) -> int:
@@ -814,7 +1332,9 @@ class USStockTrading:
                     'message': f'Market sell order completed ({quantity} shares)'
                 }
             else:
-                error_msg = f"{res.getErrorCode()} - {res.getErrorMessage()}"
+                error_msg = sanitize_reason(
+                    f"{res.getErrorCode()} - {res.getErrorMessage()}"
+                ) or "Broker rejected SELL order"
                 logger.error(f"Sell order failed: {error_msg}")
 
                 return {
@@ -826,13 +1346,14 @@ class USStockTrading:
                 }
 
         except Exception as e:
-            logger.error(f"Error during sell order: {str(e)}")
+            safe_error = sanitize_reason(str(e)) or "Unknown SELL transport error"
+            logger.error(f"Error during sell order: {safe_error}")
             return {
                 'success': False,
                 'order_no': None,
                 'ticker': ticker,
                 'quantity': quantity,
-                'message': f'Sell order error: {str(e)}'
+                'message': f'Sell order error: {safe_error}'
             }
 
     def is_market_open(self) -> bool:
@@ -900,10 +1421,28 @@ class USStockTrading:
         import sqlite3
         from pathlib import Path
 
+        conn = None
         try:
             db_path = Path(__file__).resolve().parent.parent.parent / "stock_tracking_db.sqlite"
             conn = sqlite3.connect(str(db_path))
             cursor = conn.cursor()
+            _ensure_us_order_ledger(conn)
+            _bootstrap_pending_orders_to_ledger(conn)
+
+            active = self._get_active_buy_ledger_row(conn, ticker) if order_type.lower() == "buy" else None
+            if active:
+                conn.close()
+                return {
+                    'success': False,
+                    'order_no': active.get("order_no"),
+                    'ticker': ticker,
+                    'quantity': 0,
+                    'limit_price': limit_price,
+                    'message': (
+                        f"Reserved buy queue blocked for {ticker}: active buy order exists "
+                        f"(status={active.get('status')}, source={active.get('source')}, ledger_id={active.get('id')})"
+                    )
+                }
 
             # Ensure table exists
             cursor.execute("""
@@ -946,8 +1485,27 @@ class USStockTrading:
                     now_kst,
                 )
             )
-            conn.commit()
             pending_id = cursor.lastrowid
+            if order_type.lower() == "buy":
+                _record_us_order_ledger(
+                    conn,
+                    account_key=self.account_key,
+                    account_name=self.account_name,
+                    product_code=self.product_code,
+                    mode=self.mode,
+                    ticker=ticker,
+                    side="buy",
+                    status="queued",
+                    source="pending_queue",
+                    order_no=f"PENDING-{pending_id}",
+                    pending_order_id=pending_id,
+                    order_type=order_type,
+                    limit_price=limit_price,
+                    exchange=exchange,
+                    raw_order={"pending_order_id": pending_id, "buy_amount": buy_amount},
+                    commit=False,
+                )
+            conn.commit()
             conn.close()
 
             logger.info(f"[{ticker}] Reserved order queued (id={pending_id}, {order_type}, ${limit_price:.2f}) - will execute at 10:05 KST")
@@ -963,18 +1521,23 @@ class USStockTrading:
             }
 
         except Exception as e:
-            logger.error(f"[{ticker}] Failed to queue pending order: {e}")
+            if conn is not None:
+                conn.rollback()
+                conn.close()
+            safe_error = sanitize_reason(str(e)) or "Unknown pending-order database error"
+            logger.error(f"[{ticker}] Failed to queue pending order: {safe_error}")
             return {
                 'success': False,
                 'order_no': None,
                 'ticker': ticker,
                 'quantity': 0,
                 'limit_price': limit_price,
-                'message': f'Failed to queue pending order: {str(e)}'
+                'message': f'Failed to queue pending order: {safe_error}'
             }
 
     def buy_reserved_order(self, ticker: str, limit_price: float, buy_amount: float = None,
-                           exchange: str = None) -> Dict[str, Any]:
+                           exchange: str = None, force_submit: bool = False,
+                           submission_ledger_id: Optional[int] = None) -> Dict[str, Any]:
         """
         Reserved order buy for US stock (executed at next market open)
         Reserved buy order - automatically executed at next market open
@@ -1017,12 +1580,15 @@ class USStockTrading:
 
         amount = buy_amount if buy_amount else self.buy_amount
 
-        if not self.is_reserved_order_available():
+        if not force_submit and not self.is_reserved_order_available():
             # Queue the order for later batch execution (us_pending_order_batch.py at 10:05 KST)
             return self._queue_pending_order(
                 ticker=ticker, order_type='buy', limit_price=limit_price,
                 buy_amount=amount, exchange=exchange
             )
+
+        if not self._validate_buy_submission_claim(ticker, submission_ledger_id):
+            return self._missing_buy_claim_result(ticker, limit_price=limit_price)
 
         # Calculate quantity based on limit price
         buy_quantity = math.floor(amount / limit_price)
@@ -1075,7 +1641,9 @@ class USStockTrading:
                     'message': f'Reserved buy order completed ({buy_quantity} shares x ${limit_price:.2f})'
                 }
             else:
-                error_msg = f"{res.getErrorCode()} - {res.getErrorMessage()}"
+                error_msg = sanitize_reason(
+                    f"{res.getErrorCode()} - {res.getErrorMessage()}"
+                ) or "Broker rejected reserved BUY order"
                 logger.error(f"Reserved buy order failed: {error_msg}")
 
                 return {
@@ -1088,14 +1656,15 @@ class USStockTrading:
                 }
 
         except Exception as e:
-            logger.error(f"Error during reserved buy order: {str(e)}")
+            safe_error = sanitize_reason(str(e)) or "Unknown reserved BUY transport error"
+            logger.error(f"Error during reserved buy order: {safe_error}")
             return {
                 'success': False,
                 'order_no': None,
                 'ticker': ticker,
                 'quantity': buy_quantity,
                 'limit_price': limit_price,
-                'message': f'Reserved buy order error: {str(e)}'
+                'message': f'Reserved buy order error: {safe_error}'
             }
 
     def sell_reserved_order(self, ticker: str, limit_price: float = None,
@@ -1210,7 +1779,9 @@ class USStockTrading:
                     'message': f'Reserved sell order completed ({quantity} shares, {order_type_str})'
                 }
             else:
-                error_msg = f"{res.getErrorCode()} - {res.getErrorMessage()}"
+                error_msg = sanitize_reason(
+                    f"{res.getErrorCode()} - {res.getErrorMessage()}"
+                ) or "Broker rejected reserved SELL order"
                 logger.error(f"Reserved sell order failed: {error_msg}")
 
                 return {
@@ -1222,17 +1793,20 @@ class USStockTrading:
                 }
 
         except Exception as e:
-            logger.error(f"Error during reserved sell order: {str(e)}")
+            safe_error = sanitize_reason(str(e)) or "Unknown reserved SELL transport error"
+            logger.error(f"Error during reserved sell order: {safe_error}")
             return {
                 'success': False,
                 'order_no': None,
                 'ticker': ticker,
                 'quantity': quantity,
-                'message': f'Reserved sell order error: {str(e)}'
+                'message': f'Reserved sell order error: {safe_error}'
             }
 
     def smart_buy(self, ticker: str, buy_amount: float = None,
-                  exchange: str = None, limit_price: float = None) -> Dict[str, Any]:
+                  exchange: str = None, limit_price: float = None,
+                  route: str = None,
+                  submission_ledger_id: Optional[int] = None) -> Dict[str, Any]:
         """
         Smart buy - automatically choose best method based on market hours
 
@@ -1258,6 +1832,48 @@ class USStockTrading:
                 'message': 'Auto trading is disabled (AUTO_TRADING=False)'
             }
 
+        if route is not None:
+            if not limit_price or limit_price <= 0:
+                return {
+                    'success': False,
+                    'order_no': None,
+                    'ticker': ticker,
+                    'quantity': 0,
+                    'message': 'US stocks require a positive limit_price for routed buy orders',
+                }
+            if route == "direct_limit":
+                return self.buy_limit_price(
+                    ticker,
+                    limit_price,
+                    buy_amount,
+                    exchange,
+                    submission_ledger_id=submission_ledger_id,
+                )
+            if route == "direct_reserved":
+                return self.buy_reserved_order(
+                    ticker,
+                    limit_price,
+                    buy_amount,
+                    exchange,
+                    force_submit=True,
+                    submission_ledger_id=submission_ledger_id,
+                )
+            if route == "local_queue":
+                return self._queue_pending_order(
+                    ticker=ticker,
+                    order_type='buy',
+                    limit_price=limit_price,
+                    buy_amount=buy_amount,
+                    exchange=exchange,
+                )
+            return {
+                'success': False,
+                'order_no': None,
+                'ticker': ticker,
+                'quantity': 0,
+                'message': f'Unknown buy routing decision: {route}',
+            }
+
         if self.is_market_open():
             # US stocks do NOT support market price buy (시장가 매수).
             # KIS API TTTT1002U ORD_DVSN "00" = limit price (지정가), not market price.
@@ -1265,7 +1881,13 @@ class USStockTrading:
             # Always use limit price buy with the provided price.
             if limit_price and limit_price > 0:
                 logger.info(f"[{ticker}] Market is open - executing limit buy @ ${limit_price:.2f}")
-                return self.buy_limit_price(ticker, limit_price, buy_amount, exchange)
+                return self.buy_limit_price(
+                    ticker,
+                    limit_price,
+                    buy_amount,
+                    exchange,
+                    submission_ledger_id=submission_ledger_id,
+                )
             else:
                 logger.warning(f"[{ticker}] Market is open but no limit_price provided - cannot execute buy")
                 return {
@@ -1279,7 +1901,13 @@ class USStockTrading:
             # Market is closed - use reserved order if limit_price provided
             if limit_price and limit_price > 0:
                 logger.info(f"[{ticker}] Market is closed - placing reserved order (limit: ${limit_price:.2f})")
-                return self.buy_reserved_order(ticker, limit_price, buy_amount, exchange)
+                return self.buy_reserved_order(
+                    ticker,
+                    limit_price,
+                    buy_amount,
+                    exchange,
+                    submission_ledger_id=submission_ledger_id,
+                )
             else:
                 logger.warning(f"[{ticker}] Market is closed and no limit_price provided - cannot place reserved order")
                 return {
@@ -1400,8 +2028,17 @@ class USStockTrading:
         async with stock_lock:
             async with self._semaphore:
                 async with self._global_lock:
+                    submission_ledger_id = None
                     try:
                         logger.info(f"[Async Buy] {ticker} starting (amount: ${amount:.2f})")
+
+                        guard_result = await asyncio.to_thread(
+                            self._preflight_buy_order_guard, ticker, exchange
+                        )
+                        if guard_result:
+                            result.update(guard_result)
+                            logger.warning(result["message"])
+                            return result
 
                         # Get current price
                         price_info = await asyncio.to_thread(
@@ -1447,20 +2084,95 @@ class USStockTrading:
                         effective_limit_price = limit_price if (limit_price and limit_price > 0) else current_price
                         logger.info(f"[Async Buy] {ticker} limit_price: ${effective_limit_price:.2f} (provided: {limit_price})")
 
+                        # Local queue creation is already atomic with its ledger row.
+                        # Direct KIS submission needs a cross-process claim before
+                        # entering the irreversible network call.
+                        market_open = self.is_market_open()
+                        reserved_available = (
+                            False if market_open else self.is_reserved_order_available()
+                        )
+                        if market_open:
+                            buy_route = "direct_limit"
+                        elif reserved_available:
+                            buy_route = "direct_reserved"
+                        else:
+                            buy_route = "local_queue"
+
+                        if buy_route != "local_queue":
+                            submission_ledger_id = await asyncio.to_thread(
+                                self._claim_buy_submission,
+                                ticker,
+                                buy_quantity,
+                                effective_limit_price,
+                                exchange,
+                            )
+                            if submission_ledger_id is None:
+                                result["message"] = (
+                                    f"Buy blocked for {ticker}: another process owns the active submission claim"
+                                )
+                                return result
+
                         buy_result = await asyncio.to_thread(
-                            self.smart_buy, ticker, amount, exchange, effective_limit_price
+                            self.smart_buy,
+                            ticker,
+                            amount,
+                            exchange,
+                            effective_limit_price,
+                            route=buy_route,
+                            submission_ledger_id=submission_ledger_id,
                         )
 
                         if buy_result['success']:
                             result['success'] = True
                             result['order_no'] = buy_result['order_no']
                             result['message'] = f"Buy completed: {buy_quantity} shares x ${current_price:.2f} = ${result['total_amount']:.2f}"
+                            await asyncio.to_thread(
+                                self._record_successful_buy_order,
+                                ticker,
+                                buy_result,
+                                limit_price=effective_limit_price,
+                                quantity=buy_quantity,
+                                exchange=exchange,
+                                ledger_id=submission_ledger_id,
+                            )
                         else:
                             result['message'] = f"Buy failed: {buy_result['message']}"
+                            if submission_ledger_id is not None:
+                                failure_message = str(buy_result.get("message") or "")
+                                ambiguous = any(
+                                    marker in failure_message.lower()
+                                    for marker in (" timeout", "connection", " error:", "exception")
+                                )
+                                await asyncio.to_thread(
+                                    self._update_buy_submission_claim,
+                                    submission_ledger_id,
+                                    "submission_uncertain" if ambiguous else "failed",
+                                    buy_result,
+                                    failure_message,
+                                )
 
+                    except asyncio.CancelledError:
+                        if submission_ledger_id is not None:
+                            await asyncio.to_thread(
+                                self._update_buy_submission_claim,
+                                submission_ledger_id,
+                                "submission_uncertain",
+                                None,
+                                "async buy cancelled or timed out during submission",
+                            )
+                        raise
                     except Exception as e:
-                        result['message'] = f'Async buy error: {str(e)}'
-                        logger.error(f"[Async Buy] {ticker} error: {str(e)}")
+                        safe_error = sanitize_reason(str(e)) or "Unknown async BUY error"
+                        if submission_ledger_id is not None:
+                            await asyncio.to_thread(
+                                self._update_buy_submission_claim,
+                                submission_ledger_id,
+                                "submission_uncertain",
+                                None,
+                                safe_error,
+                            )
+                        result['message'] = f'Async buy error: {safe_error}'
+                        logger.error(f"[Async Buy] {ticker} error: {safe_error}")
 
                     await asyncio.sleep(0.1)
 
@@ -1594,8 +2306,9 @@ class USStockTrading:
                             result['message'] = f"Sell failed: {sell_result['message']}"
 
                     except Exception as e:
-                        result['message'] = f'Async sell error: {str(e)}'
-                        logger.error(f"[Async Sell] {ticker} error: {str(e)}")
+                        safe_error = sanitize_reason(str(e)) or "Unknown async SELL error"
+                        result['message'] = f'Async sell error: {safe_error}'
+                        logger.error(f"[Async Sell] {ticker} error: {safe_error}")
 
                     await asyncio.sleep(0.1)
 
@@ -1669,7 +2382,8 @@ class USStockTrading:
                 time.sleep(0.1)  # Rate limit
 
             except Exception as e:
-                logger.error(f"Error getting portfolio for {exchange}: {str(e)}")
+                safe_error = sanitize_reason(str(e)) or "Unknown portfolio inquiry error"
+                logger.error(f"Error getting portfolio for {exchange}: {safe_error}")
                 continue
 
         # Deduplicate by ticker (KIS API may return same stock from multiple exchanges)
@@ -1774,11 +2488,15 @@ class USStockTrading:
 
                 return summary
 
-            logger.error(f"Account summary API failed: {res.getErrorCode()} - {res.getErrorMessage()}")
+            safe_error = sanitize_reason(
+                f"{res.getErrorCode()} - {res.getErrorMessage()}"
+            ) or "Broker rejected account-summary inquiry"
+            logger.error(f"Account summary API failed: {safe_error}")
             return None
 
         except Exception as e:
-            logger.error(f"Error getting account summary: {str(e)}")
+            safe_error = sanitize_reason(str(e)) or "Unknown account-summary inquiry error"
+            logger.error(f"Error getting account summary: {safe_error}")
             return None
 
     # ──────────────────────────────────────────────────────────────────────────
@@ -1884,7 +2602,9 @@ class USStockTrading:
                     'message': f'{action} order completed (orgn={orgn_odno})'
                 }
             else:
-                error_msg = f"{res.getErrorCode()} - {res.getErrorMessage()}"
+                error_msg = sanitize_reason(
+                    f"{res.getErrorCode()} - {res.getErrorMessage()}"
+                ) or f"Broker rejected {action.lower()} order"
                 logger.error(f"[{ticker}] {action} order failed: {error_msg}")
                 return {
                     'success': False,
@@ -1895,13 +2615,14 @@ class USStockTrading:
                 }
 
         except Exception as e:
-            logger.error(f"Error during {action.lower()} order: {str(e)}")
+            safe_error = sanitize_reason(str(e)) or f"Unknown {action.lower()} order error"
+            logger.error(f"Error during {action.lower()} order: {safe_error}")
             return {
                 'success': False,
                 'order_no': None,
                 'ticker': ticker,
                 'quantity': quantity,
-                'message': f'Error during {action.lower()} order: {str(e)}'
+                'message': f'Error during {action.lower()} order: {safe_error}'
             }
 
     def amend_order(self, ticker: str, orgn_odno: str, limit_price: float,
@@ -1953,16 +2674,20 @@ class USStockTrading:
         }
 
         out: List[Dict[str, Any]] = []
+        self._last_unfilled_order_inquiry_ok = False
         try:
             res = self._request(api_url, tr_id, params)
             if not res.isOK():
-                error_msg = f"{res.getErrorCode()} - {res.getErrorMessage()}"
+                error_msg = sanitize_reason(
+                    f"{res.getErrorCode()} - {res.getErrorMessage()}"
+                ) or "Broker rejected unfilled-order inquiry"
                 logger.warning(f"Unfilled-order inquiry failed: {error_msg}")
                 return out
 
             output = res.getBody().output
             if not isinstance(output, list):
                 output = [output] if output else []
+            self._last_unfilled_order_inquiry_ok = True
 
             for row in output:
                 code = str(row.get('pdno', '') or '').strip().upper()
@@ -1981,7 +2706,8 @@ class USStockTrading:
             return out
 
         except Exception as e:
-            logger.warning(f"Error during unfilled-order inquiry: {str(e)}")
+            safe_error = sanitize_reason(str(e)) or "Unknown unfilled-order inquiry error"
+            logger.warning(f"Error during unfilled-order inquiry: {safe_error}")
             return out
 
 
@@ -2148,7 +2874,8 @@ class MultiAccountUSTradingContext:
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         if exc_type:
-            logger.error(f"MultiAccountUSTradingContext error: {exc_type.__name__}: {exc_val}")
+            safe_error = sanitize_reason(str(exc_val)) or "Unknown multi-account context error"
+            logger.error(f"MultiAccountUSTradingContext error: {exc_type.__name__}: {safe_error}")
 
 
 # Context Manager
@@ -2189,7 +2916,8 @@ class AsyncUSTradingContext:
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         if exc_type:
-            logger.error(f"AsyncUSTradingContext error: {exc_type.__name__}: {exc_val}")
+            safe_error = sanitize_reason(str(exc_val)) or "Unknown async trading context error"
+            logger.error(f"AsyncUSTradingContext error: {exc_type.__name__}: {safe_error}")
 
 
 # ========== Test Code ==========
@@ -2203,7 +2931,8 @@ if __name__ == "__main__":
     try:
         trader = USStockTrading(mode="demo", buy_amount=100)
     except Exception as e:
-        print(f"Failed to initialize: {e}")
+        safe_error = sanitize_reason(str(e)) or "Unknown initialization error"
+        print(f"Failed to initialize: {safe_error}")
         exit(1)
 
     # 2. Market hours check
